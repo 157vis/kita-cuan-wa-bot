@@ -193,7 +193,7 @@ async def webhook(request: Request):
         logger.error("webhook: nomor tidak ditemukan. body=%s", str(body)[:500])
         return {"status": "error", "detail": "No phone number"}
 
-    if _is_outgoing_or_bot_echo(body, phone, text, _normalize_wa_phone):
+    if is_outgoing_or_bot_echo(body, phone, text, _normalize_wa_phone):
         logger.debug("ignored echo/outgoing: %s", phone)
         return {"status": "ignored", "reason": "outgoing_or_bot_echo"}
 
