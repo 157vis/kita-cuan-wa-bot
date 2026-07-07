@@ -1,12 +1,24 @@
 [build]
 builder = "NIXPACKS"
+buildEnvironment = "V3"
 
 [deploy]
 # Repo ini standalone (bukan monorepo). Root Directory di Railway
 # dikosongkan (default /), push seluruh repo. Start command reference
 # main:app langsung karena cwd = /app/ dan main.py ada di root repo.
+runtime = "V2"
+numReplicas = 1
 startCommand = "python -m uvicorn main:app --host 0.0.0.0 --port $PORT"
-healthcheckPath = "/"
-healthcheckTimeout = 120
+healthcheckPath = "/health"
+sleepApplication = false
+useLegacyStacker = false
+ipv6EgressEnabled = false
+# Format TOML valid (pakai '=' bukan ':' JSON).
+# Region default Railway saat ini biasanya asia-southeast1-eqsg3a
+# untuk project di Singapore. Valid IDs:
+#   us-west2 | us-east4-eqdc4a | europe-west4-drams3a | asia-southeast1-eqsg3a
+# Catatan: "sfo" bukan ID valid (lihat #4 di pencarian).
+# multiRegionConfig = { "asia-southeast1-eqsg3a" = { "numReplicas" = 1 } }
 restartPolicyType = "ON_FAILURE"
+healthcheckTimeout = 120
 restartPolicyMaxRetries = 5

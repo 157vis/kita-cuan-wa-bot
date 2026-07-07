@@ -55,7 +55,40 @@ _raw_provider = os.environ.get("WA_PROVIDER", "fonnte").lower().strip()
 WA_PROVIDER = "fonnte" if _raw_provider in ("fonnte", "fonte") else _raw_provider
 WA_API_KEY = os.environ.get("WA_API_KEY", "")
 SAFEGUARD_MODEL = "openai/gpt-oss-safeguard-20b"
-groq = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+# Lazy Groq client — jangan instantiate saat module-level, supaya
+# service tetap bisa start meskipun GROQ_API_KEY belum di-set di env
+# (Railway Variables). Validasi dilakukan saat pertama kali dipakai.
+_groq_client: Groq | None = None
+
+
+def get_groq() -> Groq:
+    """Ambil (atau buat) Groq client. Raise RuntimeError jika env var hilang."""
+    global _groq_client
+    if _groq_client is not None:
+        return _groq_client
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY belum di-set. Tambahkan di Railway Variables "
+            "(tab Variables di service kita-cuan-wa-bot-larisai)."
+        )
+    _groq_client = Groq(api_key=api_key)
+    return _groq_client
+
+
+@app.get("/health")
+def health() -> dict:
+    """Healthcheck endpoint — Railway akan panggil path ini berkala."""
+    required = ("SUPABASE_URL", "SUPABASE_KEY", "GROQ_API_KEY", "WA_API_KEY")
+    missing = [k for k in required if not os.environ.get(k)]
+    return {
+        "status": "ok" if not missing else "degraded",
+        "service": WA_BOT_TITLE,
+        "provider": WA_PROVIDER,
+        "missing_env": missing,
+        "bot_logic_version": BOT_LOGIC_VERSION,
+    }
 
 
 def _normalize_wa_phone(phone: str) -> str:

@@ -67,9 +67,34 @@ python -m uvicorn main:app --reload --port 8000
 
 ## API Endpoints
 
-- `GET /` — health check
-- `GET /health` — health check
+- `GET /` — landing info
+- `GET /health` — health check (return `{status, missing_env, ...}`)
 - `POST /webhook` — webhook Fonnte WhatsApp
+
+## Troubleshooting
+
+### `KeyError: 'GROQ_API_KEY'` saat startup
+
+Service **WAJIB** memiliki variabel `GROQ_API_KEY` (dan `SUPABASE_URL`,
+`SUPABASE_KEY`, `WA_API_KEY`) di Railway Variables.
+
+Cek:
+1. Buka project Railway → service `kita-cuan-wa-bot-larisai` → tab **Variables**.
+2. Pastikan variabel berikut ada dan tidak kosong:
+   - `SUPABASE_URL`
+   - `SUPABASE_KEY` (atau `SUPABASE_SERVICE_KEY`)
+   - `GROQ_API_KEY`
+   - `WA_API_KEY`
+3. Klik **+ New Variable** untuk menambah yang kurang.
+4. **Redeploy** service (tombol Redeploy di tab Deployments).
+
+Verifikasi cepat: buka `https://kita-cuan-wa-bot-larisai.up.railway.app/health`
+di browser. Response JSON menampilkan `missing_env` jika ada yang kurang.
+
+### Service `404 Application not found`
+
+Railway men-suspend service yang crash terus. Setelah env var lengkap,
+**Redeploy** manual. Cek tab **Logs** untuk error runtime lain.
 
 ## License
 
