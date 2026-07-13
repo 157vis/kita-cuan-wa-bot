@@ -24,6 +24,7 @@ from agents import (  # noqa: E402
     db_insert_transaction,
     get_ai_advisor_insights,
     get_ai_piutang_answer,
+    get_core,
     get_dashboard_data,
     resolve_user_id,
     vision_extractor_agent,
@@ -51,6 +52,20 @@ from orchestrator import orchestrate_transaction_created  # noqa: E402
 logger = get_logger(__name__)
 
 app = FastAPI(title=WA_BOT_TITLE)
+
+
+# Global exception handler — pastikan TIDAK ADA error yang sampai ke user
+# sebagai HTTP 500 tanpa body JSON. Fonnte butuh 200 + JSON untuk ACK webhook.
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception) -> dict:
+    logger.exception(
+        "unhandled exception on %s %s: %s", request.method, request.url.path, exc
+    )
+    return {
+        "status": "error",
+        "detail": str(exc)[:500],
+        "type": exc.__class__.__name__,
+    }
 
 _raw_provider = os.environ.get("WA_PROVIDER", "fonnte").lower().strip()
 WA_PROVIDER = "fonnte" if _raw_provider in ("fonnte", "fonte") else _raw_provider
@@ -159,8 +174,8 @@ async def send_wa_reply(phone: str, message: str, inboxid: str | None = None) ->
     try:
         client = get_fonnte()
         await client.send_message(phone, message, inboxid=inboxid)
-    except (OSError, ValueError, KeyError, AttributeError) as exc:
-        logger.exception("send_wa_reply: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - tangkap SEMUA error supaya webhook tidak crash
+        logger.exception("send_wa_reply failed: %s", exc)
 
 
 async def detect_intent(text: str) -> str:
@@ -320,9 +335,12 @@ async def webhook(request: Request):
         else:
             reply = f"{bot_header()}\n\nKirim teks, foto struk, atau voice note ya~ 😊"
 
-    except (RuntimeError, ValueError, KeyError, httpx.HTTPError) as exc:
-        logger.exception("webhook error: %s", exc)
+    except (RuntimeError, ValueError, KeyError, NameError, AttributeError, httpx.HTTPError) as exc:
+        logger.exception("webhook error (known): %s", exc)
         reply = f"{bot_header()}\n\n😅 Waduh, ada gangguan sebentar.\nCoba kirim lagi ya~"
+    except Exception as exc:  # noqa: BLE001 - last-resort safety net supaya tidak return HTTP 500
+        logger.exception("webhook error (unexpected): %s", exc)
+        reply = f"{bot_header()}\n\n😅 Waduh, ada error tak terduga.\nCoba kirim lagi ya~"
 
     await asyncio.sleep(random_typing_delay())
     await send_wa_reply(phone, reply, inboxid=inboxid)
