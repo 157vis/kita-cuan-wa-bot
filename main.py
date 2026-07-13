@@ -44,6 +44,7 @@ from bot_helpers import (  # noqa: E402
     detect_intent_rules,
 )
 from config import BOT_LOGIC_VERSION, REORDER_QTY, STOCK_THRESHOLD  # noqa: E402
+from fonnte_client import FonnteClient  # noqa: E402
 from log_config import get_logger  # noqa: E402
 from orchestrator import orchestrate_transaction_created  # noqa: E402
 
@@ -53,8 +54,20 @@ app = FastAPI(title=WA_BOT_TITLE)
 
 _raw_provider = os.environ.get("WA_PROVIDER", "fonnte").lower().strip()
 WA_PROVIDER = "fonnte" if _raw_provider in ("fonnte", "fonte") else _raw_provider
-WA_API_KEY = os.environ.get("WA_API_KEY", "")
+# WA_API_KEY jadi OPSIONAL — fallback saja. Token utama dibaca dari Supabase.
+WA_API_KEY = os.environ.get("WA_API_KEY", "").strip()
 SAFEGUARD_MODEL = "openai/gpt-oss-safeguard-20b"
+
+# Fonnte client multi-tenant (lazy init setelah supabase siap)
+_fonnte: FonnteClient | None = None
+
+
+def get_fonnte() -> FonnteClient:
+    """Lazy init FonnteClient — Supabase service client dari agents.core."""
+    global _fonnte
+    if _fonnte is None:
+        _fonnte = FonnteClient(get_core().supabase)
+    return _fonnte
 
 # Lazy Groq client — jangan instantiate saat module-level, supaya
 # service tetap bisa start meskipun GROQ_API_KEY belum di-set di env
@@ -79,14 +92,20 @@ def get_groq() -> Groq:
 
 @app.get("/health")
 def health() -> dict:
-    """Healthcheck endpoint — Railway akan panggil path ini berkala."""
-    required = ("SUPABASE_URL", "SUPABASE_KEY", "GROQ_API_KEY", "WA_API_KEY")
+    """Healthcheck endpoint — Railway akan panggil path ini berkala.
+
+    Multi-tenant: WA_API_KEY tidak wajib. Token Fonnte per-client
+    dibaca dari tabel `clients` di Supabase (kolom `fonnte_token`).
+    """
+    required = ("SUPABASE_URL", "SUPABASE_KEY", "GROQ_API_KEY")
     missing = [k for k in required if not os.environ.get(k)]
     return {
         "status": "ok" if not missing else "degraded",
         "service": WA_BOT_TITLE,
         "provider": WA_PROVIDER,
         "missing_env": missing,
+        "env_token_fallback": bool(WA_API_KEY),
+        "token_source": "supabase_per_client",
         "bot_logic_version": BOT_LOGIC_VERSION,
     }
 
@@ -129,36 +148,18 @@ def _orchestrate(user_id: str, raw_text: str, data: list[dict]) -> str:
 
 
 async def send_wa_reply(phone: str, message: str, inboxid: str | None = None) -> None:
+    """Kirim balasan WA — multi-tenant.
+
+    Token Fonnte di-resolve otomatis per-nomor dari tabel `clients` Supabase.
+    Fallback ke env `WA_API_KEY` kalau ada (backward compat untuk legacy).
+    """
     if not phone or not message:
         logger.warning("send_wa_reply: phone/message kosong")
         return
-    if not WA_API_KEY:
-        logger.error("send_wa_reply: WA_API_KEY kosong")
-        return
-    target = _normalize_wa_phone(phone)
     try:
-        if WA_PROVIDER == "fonnte":
-            payload = {"target": target, "message": message}
-            if inboxid:
-                payload["inboxid"] = inboxid
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    "https://api.fonnte.com/send",
-                    headers={"Authorization": WA_API_KEY},
-                    data=payload,
-                )
-            logger.debug("fonnte send → %s: %s", resp.status_code, resp.text[:300])
-            if resp.status_code >= 400:
-                logger.error("fonnte send gagal — cek WA_API_KEY")
-        elif WA_PROVIDER == "wablas":
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    "https://solo.wablas.com/api/v2/send-message",
-                    headers={"Authorization": f"Bearer {WA_API_KEY}"},
-                    json={"data": [{"phone": target, "message": message}]},
-                )
-            logger.debug("wablas send → %s: %s", resp.status_code, resp.text[:300])
-    except httpx.HTTPError as exc:
+        client = get_fonnte()
+        await client.send_message(phone, message, inboxid=inboxid)
+    except (OSError, ValueError, KeyError, AttributeError) as exc:
         logger.exception("send_wa_reply: %s", exc)
 
 
@@ -336,7 +337,9 @@ async def health():
         "bot_name": BOT_NAME,
         "provider": WA_PROVIDER,
         "bot_logic_version": BOT_LOGIC_VERSION,
-        "wa_key_set": bool(WA_API_KEY),
+        "wa_key_set": bool(WA_API_KEY),  # fallback env token (backward compat)
+        "token_source": "supabase_per_client",
+        "env_token_fallback": bool(WA_API_KEY),
         "supabase_set": bool(os.environ.get("SUPABASE_URL")),
         "groq_set": bool(os.environ.get("GROQ_API_KEY")),
         "webhook": "/webhook",
