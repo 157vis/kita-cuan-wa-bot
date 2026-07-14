@@ -410,7 +410,7 @@ async def webhook(request: Request):
             f"Atau tanya: _{BOT_NAME.lower()}, gimana bisnis aku?_"
         )
         await asyncio.sleep(random.uniform(0.5, 1.5))
-        await send_wa_reply(phone, reply, inboxid=inboxid)
+        await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
         logged = _persist_wa_log(phone, text, reply)
         return {"status": "ok", "mode": "ping", "wa_logged": logged}
 
@@ -561,7 +561,7 @@ async def webhook(request: Request):
         reply = f"{bot_header()}\n\n😅 Waduh, ada error tak terduga.\nCoba kirim lagi ya~"
 
     await asyncio.sleep(random_typing_delay())
-    await send_wa_reply(phone, reply, inboxid=inboxid)
+    await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
     _persist_wa_log(phone, text, reply, user_id=user_id)
     return {"status": "ok"}
 
