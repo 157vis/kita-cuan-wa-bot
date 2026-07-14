@@ -304,7 +304,11 @@ async def webhook(request: Request):
     user_id = None
 
     try:
-        user_id = resolve_user_id(phone)
+        try:
+            user_id = resolve_user_id(phone)
+        except ValueError:
+            # Nomor tidak ada di wa_users → customer (bukan owner)
+            user_id = None
 
         # === CUSTOMER (bukan owner) → forward ke CS AI Multi-Agent ===
         if not user_id and text:
