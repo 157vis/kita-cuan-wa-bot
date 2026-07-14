@@ -51,6 +51,9 @@ from orchestrator import orchestrate_transaction_created  # noqa: E402
 
 logger = get_logger(__name__)
 
+# CS Webhook (BukuWarung AI Multi-Agent) — handle customer conversation
+DEFAULT_CSAT_BASE_URL = "https://bukuwarung-ai-larisai.up.railway.app"
+
 app = FastAPI(title=WA_BOT_TITLE)
 
 
@@ -162,6 +165,68 @@ def _orchestrate(user_id: str, raw_text: str, data: list[dict]) -> str:
     )
 
 
+def _csat_base_url() -> str:
+    """URL bukuwarung-ai CS webhook (AI Multi-Agent)."""
+    return (
+        os.environ.get("BUKUWARUNG_BASE_URL", "").strip().rstrip("/")
+        or DEFAULT_CSAT_BASE_URL
+    )
+
+
+async def _ask_csat_agent(user_id: str, sender: str, text: str, name: str) -> str | None:
+    """Forward customer message ke AI Multi-Agent (CS / Sales agent).
+
+    Returns the agent's reply text, or None kalau gagal.
+    """
+    if not user_id:
+        return None
+    url = f"{_csat_base_url()}/webhook/csat/{user_id}"
+    payload = {
+        "message": text or "",
+        "sender": sender,
+        "name": name or "",
+        "channel": "wa",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(url, json=payload)
+        if resp.status_code >= 400:
+            logger.warning("csat webhook HTTP %s: %s", resp.status_code, resp.text[:200])
+            return None
+        data = resp.json()
+        # Beberapa versi return {reply: "..."} atau {intent: ...}
+        reply = (
+            data.get("reply")
+            or data.get("response")
+            or data.get("message")
+            or data.get("text")
+        )
+        if not reply:
+            # Kalau agent hanya detect intent, generate fallback berdasarkan intent
+            intent = (data.get("intent") or "").lower()
+            agent = (data.get("agent") or "").lower()
+            if intent == "greeting":
+                reply = (
+                    "Halo! Selamat datang di Toko Rafih 👋\n"
+                    "Ada yang bisa saya bantu? Silakan tanya produk, "
+                    "harga, atau stok ya~"
+                )
+            elif intent in ("sales", "product_inquiry"):
+                reply = (
+                    "Tertarik dengan produk kami? Boleh tau barang yang "
+                    "Anda cari? Saya bantu cek stok dan harganya ya 😊"
+                )
+            elif agent:
+                reply = (
+                    f"Terima kasih sudah menghubungi kami 🙏\n"
+                    f"Silakan tunggu, admin kami akan segera membantu."
+                )
+        return reply
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("csat forward failed: %s", exc)
+        return None
+
+
 async def send_wa_reply(phone: str, message: str, inboxid: str | None = None) -> None:
     """Kirim balasan WA — multi-tenant.
 
@@ -238,6 +303,28 @@ async def webhook(request: Request):
 
     try:
         user_id = resolve_user_id(phone)
+
+        # === CUSTOMER (bukan owner) → forward ke CS AI Multi-Agent ===
+        if not user_id and text:
+            logger.info("customer message from %s — forwarding to CSAT", phone)
+            csat_reply = await _ask_csat_agent(
+                user_id="",  # CS endpoint handle unknown sender
+                sender=phone,
+                text=text,
+                name=body.get("name", ""),
+            )
+            if csat_reply:
+                reply = f"{bot_header()}\n\n{csat_reply}"
+            else:
+                reply = (
+                    f"{bot_header()}\n\n"
+                    f"Halo! 👋 Selamat datang di toko kami.\n"
+                    f"Silakan tanya produk, harga, atau stok ya~\n"
+                    f"Admin kami akan segera membantu 😊"
+                )
+            await asyncio.sleep(random_typing_delay())
+            await send_wa_reply(phone, reply, inboxid=inboxid)
+            return {"status": "ok", "mode": "cs_customer", "wa_logged": True}
 
         if media_type in ("image", "photo") and media_url:
             async with httpx.AsyncClient() as client:
