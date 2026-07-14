@@ -95,6 +95,63 @@ class FonnteClient:
 
         return ""
 
+    async def lookup_token_by_device(self, device: str) -> str:
+        """Cari fonnte_token yang punya nomor device di metadata.device
+        atau di owner_phones (device = nomor Fonnte toko yang menerima pesan).
+
+        Pakai ini untuk kirim BALASAN ke customer: balasan dikirim via
+        device toko, bukan via device customer.
+
+        Returns:
+            fonnte_token atau "" kalau tidak ketemu.
+        """
+        if not device:
+            return ""
+
+        device_norm = self._normalize_phone(device)
+
+        if not self._db:
+            return self._env_token or ""
+
+        try:
+            result = await asyncio.to_thread(
+                lambda: (
+                    self._db.table("clients")
+                    .select("client_id, fonnte_token, owner_phones, metadata")
+                    .eq("is_active", True)
+                    .execute()
+                )
+            )
+            rows = result.data or []
+            for row in rows:
+                token = (row.get("fonnte_token") or "").strip()
+                if not token:
+                    continue
+                # Cek metadata.device (kalau ada)
+                meta = row.get("metadata") or {}
+                if isinstance(meta, dict):
+                    meta_device = meta.get("device") or meta.get("fonnte_device")
+                    if meta_device and self._normalize_phone(str(meta_device)) == device_norm:
+                        self._cache[row.get("client_id")] = token
+                        logger.info(
+                            "fonnte token resolved by device=%s -> client_id=%s",
+                            device_norm, row.get("client_id"),
+                        )
+                        return token
+                # Fallback: kalau tidak ada metadata, pakai owner_phones pertama
+                owners = row.get("owner_phones") or []
+                if owners and self._normalize_phone(str(owners[0])) == device_norm:
+                    self._cache[row.get("client_id")] = token
+                    logger.info(
+                        "fonnte token resolved by owner_phones=%s -> client_id=%s",
+                        device_norm, row.get("client_id"),
+                    )
+                    return token
+        except Exception as exc:
+            logger.warning("lookup fonnte_token by device gagal: %s", exc)
+
+        return ""
+
     async def send_message(
         self, phone: str, message: str, inboxid: str | None = None
     ) -> bool:
