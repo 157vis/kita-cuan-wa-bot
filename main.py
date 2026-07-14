@@ -278,6 +278,21 @@ async def _ask_csat_agent(user_id: str, sender: str, text: str, name: str) -> st
                     "Tertarik dengan produk kami? Boleh tau barang yang "
                     "Anda cari? Saya bantu cek stok dan harganya ya 😊"
                 )
+            elif intent == "order":
+                # Customer mau order — minta detail
+                reply = (
+                    "Siap! Boleh info detail ordernya ya:\n"
+                    "• Nama barang\n"
+                    "• Jumlah\n"
+                    "• Alamat kirim (kalau perlu)\n\n"
+                    "Nanti saya proses secepatnya 🙏"
+                )
+            elif intent == "cs" or agent in ("cs", "support"):
+                reply = (
+                    "Terima kasih sudah menghubungi kami 🙏\n"
+                    "Boleh ceritakan keluhan atau pertanyaanmu?\n"
+                    "Admin kami akan segera membantu 😊"
+                )
             elif agent:
                 reply = (
                     f"Terima kasih sudah menghubungi kami 🙏\n"
