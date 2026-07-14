@@ -214,6 +214,9 @@ async def _resolve_tenant_by_device(device: str) -> str | None:
             if isinstance(meta, dict):
                 meta_dev = meta.get("device") or meta.get("fonnte_device")
                 if meta_dev and "".join(ch for ch in str(meta_dev) if ch.isdigit()).lstrip("0").lstrip("62").startswith(digits.lstrip("62")):
+                    # Prefer metadata.user_id (UUID) untuk CS agent URL
+                    if meta.get("user_id"):
+                        return meta.get("user_id")
                     return row.get("client_id")
             # Fallback: owner_phones[0] cocok dengan device
             owners = row.get("owner_phones") or []
@@ -222,6 +225,9 @@ async def _resolve_tenant_by_device(device: str) -> str | None:
                 if owner_norm.startswith("0"):
                     owner_norm = "62" + owner_norm[1:]
                 if owner_norm == digits:
+                    # Prefer metadata.user_id (UUID) untuk CS agent URL
+                    if isinstance(meta, dict) and meta.get("user_id"):
+                        return meta.get("user_id")
                     return row.get("client_id")
     except Exception as exc:
         logger.warning("resolve_tenant_by_device gagal: %s", exc)
@@ -232,8 +238,9 @@ async def _resolve_tenant_by_device(device: str) -> str | None:
 async def _ask_csat_agent(user_id: str, sender: str, text: str, name: str) -> str | None:
     """Forward customer message ke AI Multi-Agent (CS / Sales agent).
 
-    Returns the agent's reply text, or None kalau gagal.
-    user_id di sini = client_id (toko tenant) untuk CS routing.
+    Returns the agent's reply text, atau None kalau gagal.
+    user_id di sini = `metadata.user_id` (UUID) dari tabel `clients`,
+    BUKAN `client_id` string. CS agent route expects UUID.
     """
     url = f"{_csat_base_url()}/webhook/csat/{user_id}"
     payload = {
