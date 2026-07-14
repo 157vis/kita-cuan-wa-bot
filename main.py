@@ -177,10 +177,12 @@ async def _ask_csat_agent(user_id: str, sender: str, text: str, name: str) -> st
     """Forward customer message ke AI Multi-Agent (CS / Sales agent).
 
     Returns the agent's reply text, or None kalau gagal.
+    NOTE: Untuk customer (bukan owner), user_id akan kosong.
+    Kita tetap forward ke CS endpoint dengan sender info.
     """
-    if not user_id:
-        return None
-    url = f"{_csat_base_url()}/webhook/csat/{user_id}"
+    # Untuk customer (bukan owner), user_id kosong — tetap lanjut,
+    # CS endpoint akan handle unknown sender (fallback profile).
+    url = f"{_csat_base_url()}/webhook/csat/{user_id or 'customer'}"
     payload = {
         "message": text or "",
         "sender": sender,
