@@ -657,18 +657,39 @@ class LarisCore:
             logger.error("sync_product_from_inventory user=%s: %s", uid, exc)
             return None
 
-    def list_products(self, user_id: str):
-        """Daftar produk + stok terkini milik tenant."""
+    def list_products(self, user_id: str, active_only: bool = True):
+        """Daftar produk + stok terkini milik tenant.
+
+        Args:
+            user_id: UUID tenant pemilik produk.
+            active_only: kalau True, hanya tampilkan produk dengan is_active=True.
+        """
         uid = self._require_user_id(user_id)
         try:
-            resp = (
-                self.supabase.table("products")
-                .select("id, name, stock, created_at")
-                .eq("user_id", uid)
-                .order("name", desc=False)
-                .execute()
-            )
-            return resp.data or []
+            # Select field selengkap mungkin: price, category, is_active dipakai
+            # untuk render di WA bot (/stok, /produk) dan dashboard Streamlit.
+            # Fallback: kalau kolom is_active tidak ada / query gagal,
+            # ambil semua row tanpa filter (lebih baik tampil dari pada kosong).
+            try:
+                query = (
+                    self.supabase.table("products")
+                    .select("id, name, price, stock, category, is_active, created_at")
+                    .eq("user_id", uid)
+                )
+                if active_only:
+                    query = query.eq("is_active", True)
+                resp = query.order("name", desc=False).execute()
+                return resp.data or []
+            except Exception:
+                # Fallback path: tanpa filter is_active (mis. kolom belum ada / always-null)
+                resp = (
+                    self.supabase.table("products")
+                    .select("id, name, price, stock, category, is_active, created_at")
+                    .eq("user_id", uid)
+                    .order("name", desc=False)
+                    .execute()
+                )
+                return resp.data or []
         except Exception as exc:
             logger.error("list_products user=%s: %s", uid, exc)
             return None

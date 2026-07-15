@@ -356,6 +356,18 @@ async def send_wa_reply(
 
 
 async def detect_intent(text: str) -> str:
+    # === Rule-based fast path untuk intent sederhana ===
+    # (hemat LLM call kalau sudah jelas dari keyword)
+    norm = (text or "").strip().lower()
+    if norm in ("stok", "cek stok", "lihat stok", "stock"):
+        return "STOK"
+    if norm in ("produk", "list produk", "daftar produk", "semua produk", "apa saja yang dijual", "barang apa saja"):
+        return "PRODUK"
+    if norm in ("laporan", "laporan minggu ini", "laporan minggu", "rangkuman", "rekap"):
+        return "LAPORAN"
+    if norm.startswith("stok ") or norm.startswith("cek stok "):
+        return "STOK"
+
     ruled = detect_intent_rules(text)
     if ruled:
         return ruled
@@ -544,11 +556,93 @@ async def webhook(request: Request):
                 else:
                     reply = f"{bot_header()}\n\nHmm, nggak ada transaksi yg bisa dihapus nih 🤔"
 
+            elif intent == "STOK":
+                # Tampilkan produk dengan stok terendah / habis (sesuai design STOK)
+                products = core.list_products(user_id, active_only=True) if hasattr(core, "list_products") else []
+                if not products:
+                    reply = (
+                        f"{bot_header()}\n\n📦 Belum ada produk terdaftar.\n\n"
+                        f"Tambah produk di dashboard dulu ya~"
+                    )
+                else:
+                    lines = ["📦 *Stok Produk*", ""]
+                    # Sort by stock ASC: yang paling kritis di atas
+                    sorted_p = sorted(products, key=lambda p: (p.get("stock", 0) or 0, p.get("name", "").lower()))
+                    for p in sorted_p[:15]:  # max 15 baris
+                        name = p.get("name", "?")
+                        stock = p.get("stock", 0) or 0
+                        if stock <= 0:
+                            emoji = "🔴"
+                            label = "HABIS"
+                        elif stock <= 5:
+                            emoji = "🟡"
+                            label = f"{stock} (tipis)"
+                        else:
+                            emoji = "🟢"
+                            label = str(stock)
+                        lines.append(f"{emoji} {name} — {label}")
+                    reply = f"{bot_header()}\n\n" + "\n".join(lines)
+
+            elif intent == "PRODUK":
+                # List semua produk (aktif)
+                products = core.list_products(user_id, active_only=False) if hasattr(core, "list_products") else []
+                if not products:
+                    reply = (
+                        f"{bot_header()}\n\n📋 Belum ada produk.\n\n"
+                        f"Tambah produk di dashboard dulu ya~"
+                    )
+                else:
+                    lines = ["📋 *Daftar Produk*", ""]
+                    for i, p in enumerate(products[:20], start=1):
+                        name = p.get("name", "?")
+                        price = p.get("price", 0) or 0
+                        stock = p.get("stock", 0) or 0
+                        is_active = p.get("is_active", True)
+                        marker = "" if is_active else " _(non-aktif)_"
+                        price_str = f"Rp {price:,.0f}".replace(",", ".")
+                        lines.append(f"{i}. {name} — {price_str} (stok: {stock}){marker}")
+                    reply = f"{bot_header()}\n\n" + "\n".join(lines)
+
+            elif intent == "LAPORAN":
+                # Rangkuman 7 hari terakhir
+                try:
+                    df = get_dashboard_data(user_id)
+                    summary_lines = ["📊 *Laporan 7 Hari Terakhir*", ""]
+                    if df is None or df.empty:
+                        summary_lines.append("Belum ada transaksi 7 hari terakhir nih.")
+                    else:
+                        # Hitung total in/out dari kolom 'type' atau 'amount' (sesuai schema)
+                        try:
+                            if "type" in df.columns and "amount" in df.columns:
+                                in_df = df[df["type"].astype(str).str.lower().isin(["in", "income", "masuk", "pemasukan"])]
+                                out_df = df[df["type"].astype(str).str.lower().isin(["out", "expense", "keluar", "pengeluaran"])]
+                                total_in = float(in_df["amount"].sum()) if not in_df.empty else 0.0
+                                total_out = float(out_df["amount"].sum()) if not out_df.empty else 0.0
+                            else:
+                                total_in = 0.0
+                                total_out = 0.0
+                        except Exception:
+                            total_in = 0.0
+                            total_out = 0.0
+                        profit = total_in - total_out
+                        summary_lines.append(f"💰 Pemasukan: Rp {total_in:,.0f}".replace(",", "."))
+                        summary_lines.append(f"💸 Pengeluaran: Rp {total_out:,.0f}".replace(",", "."))
+                        summary_lines.append(f"📈 Margin: Rp {profit:,.0f}".replace(",", "."))
+                        summary_lines.append("")
+                        summary_lines.append(f"📝 Total transaksi: {len(df)}")
+                    reply = f"{bot_header()}\n\n" + "\n".join(summary_lines)
+                except Exception as exc:
+                    logger.exception("LAPORAN error: %s", exc)
+                    reply = (
+                        f"{bot_header()}\n\n😅 Waduh, gagal ambil data laporan.\n"
+                        f"Coba lagi nanti ya~"
+                    )
+
             else:
                 reply = (
                     f"{bot_header()}\n\n"
                     f"Hmm, {BOT_NAME} belum paham maksudmu 🤔\n\n"
-                    f"Coba:\n• _jual kopi 50rb_\n• _berapa skor_\n• _saran bisnis_\n• _hapus_"
+                    f"Coba:\n• _jual kopi 50rb_\n• _stok_ — cek stok produk\n• _produk_ — list semua produk\n• _berapa skor_\n• _saran bisnis_\n• _hapus_"
                 )
         else:
             reply = f"{bot_header()}\n\nKirim teks, foto struk, atau voice note ya~ 😊"
