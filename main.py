@@ -394,7 +394,7 @@ async def detect_intent(text: str) -> str:
         return "STOK"
     if norm in ("produk", "list produk", "daftar produk", "semua produk", "apa saja yang dijual", "barang apa saja"):
         return "PRODUK"
-    if norm in ("laporan", "laporan minggu ini", "laporan minggu", "rangkuman", "rekap"):
+    if norm in ("laporan", "laporan minggu ini", "laporan minggu", "rangkuman", "rekap", "lapor"):
         return "LAPORAN"
     if norm.startswith("stok ") or norm.startswith("cek stok "):
         return "STOK"
