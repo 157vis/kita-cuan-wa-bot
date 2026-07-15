@@ -241,7 +241,29 @@ async def _ask_csat_agent(user_id: str, sender: str, text: str, name: str) -> st
     Returns the agent's reply text, atau None kalau gagal.
     user_id di sini = `metadata.user_id` (UUID) dari tabel `clients`,
     BUKAN `client_id` string. CS agent route expects UUID.
+
+    Otak / memory:
+        Sebelum panggil CS webhook, cek otak_memories (tabel di Supabase).
+        Kalau ada jawaban tersimpan untuk pertanyaan ini (normalized match),
+        langsung pakai — hemat LLM call. Setelah dapat jawaban dari agent,
+        simpan ke memory untuk pertanyaan serupa di masa depan.
     """
+    if not text or not text.strip():
+        return None
+
+    # === Otak: cek memory dulu (incremental learning) ===
+    try:
+        _core = get_core()
+        cached = await asyncio.to_thread(_core.recall_memory, user_id, "cs", text)
+        if cached:
+            logger.info(
+                "otak HIT: skip CS webhook (user=%s q='%s')",
+                user_id, text[:40],
+            )
+            return cached
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("otak recall_memory skip: %s", exc)
+
     url = f"{_csat_base_url()}/webhook/csat/{user_id}"
     payload = {
         "message": text or "",
@@ -298,6 +320,15 @@ async def _ask_csat_agent(user_id: str, sender: str, text: str, name: str) -> st
                     f"Terima kasih sudah menghubungi kami 🙏\n"
                     f"Silakan tunggu, admin kami akan segera membantu."
                 )
+
+        # === Otak: simpan jawaban ke memory untuk dipelajari agent ===
+        if reply and reply.strip():
+            try:
+                _core2 = get_core()
+                await asyncio.to_thread(_core2.remember_answer, user_id, "cs", text, reply)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("otak remember_answer skip: %s", exc)
+
         return reply
     except Exception as exc:  # noqa: BLE001
         logger.exception("csat forward failed: %s", exc)

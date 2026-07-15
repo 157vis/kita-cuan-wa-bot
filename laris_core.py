@@ -1155,6 +1155,188 @@ class LarisCore:
             lv, ins = "low", ["Evaluasi biaya ⚠️", "Rapikan pencatatan 💪", "Kurangi stok mati 📉"]
         return {"score": total, "insight": random.choice(ins), "level": lv}
 
+    # --------------------
+    # AI Memory — incremental learning untuk CS & Catat agents
+    # --------------------
+    # Schema tabel otak_memories (Supabase):
+    #   id              uuid
+    #   user_id         text
+    #   content         text          — Q&A atau memory content (gabungan)
+    #   embedding       jsonb         — vector embedding (untuk similarity)
+    #   timestamp       timestamptz
+    #   feedback_score  double        — rating (-1.0 s/d 1.0)
+    #   weight          double        — bobot relevancy
+    #   status          text          — 'active' / 'archived' / 'invalid'
+    #   metadata        jsonb         — flexible: {agent_type, question, hit_count, ...}
+    @staticmethod
+    def _normalize_question(q: str) -> str:
+        return " ".join((q or "").lower().strip().split())
+
+    def recall_memory(
+        self, user_id: str, agent_type: str, question: str
+    ) -> str | None:
+        """Cari jawaban dari otak_memories.
+
+        Returns:
+            String jawaban kalau ditemukan di memory, else None.
+
+        Logic:
+            1. Query otak_memories WHERE user_id=uid AND status='active'.
+            2. Filter di Python dengan metadata.agent_type + normalized question
+               exact match (sederhana, tanpa embedding similarity).
+            3. Kalau ketemu: bump weight (×1.05) + increment hit_count.
+        """
+        uid = self._require_user_id(user_id)
+        if not question:
+            return None
+        norm_q = self._normalize_question(question)
+        if not norm_q:
+            return None
+        try:
+            res = (
+                self.supabase.table("otak_memories")
+                .select("id, content, metadata, weight, timestamp")
+                .eq("user_id", uid)
+                .eq("status", "active")
+                .execute()
+            )
+            rows = res.data or []
+            # Cari entri dengan agent_type match + question normalized sama
+            for row in rows:
+                meta = row.get("metadata") or {}
+                if not isinstance(meta, dict):
+                    continue
+                if meta.get("agent_type") != agent_type:
+                    continue
+                if self._normalize_question(meta.get("question", "")) != norm_q:
+                    continue
+                # HIT! Increment weight + hit_count (learning)
+                try:
+                    new_weight = (row.get("weight") or 1.0) * 1.05
+                    new_hits = int(meta.get("hit_count") or 0) + 1
+                    new_meta = dict(meta)
+                    new_meta["hit_count"] = new_hits
+                    new_meta["last_used_at"] = datetime.now().isoformat()
+                    self.supabase.table("otak_memories").update({
+                        "weight": new_weight,
+                        "metadata": new_meta,
+                        "timestamp": datetime.now().isoformat(),
+                    }).eq("id", row["id"]).execute()
+                except Exception as exc:
+                    logger.debug("recall_memory update weight: %s", exc)
+                # Extract answer dari content (format: "Q: ... | A: ...")
+                content = row.get("content", "")
+                if " | A: " in content:
+                    return content.split(" | A: ", 1)[1].strip()
+                return content
+            return None
+        except Exception as exc:
+            logger.error("recall_memory user=%s: %s", uid, exc)
+            return None
+
+    def remember_answer(
+        self,
+        user_id: str,
+        agent_type: str,
+        question: str,
+        answer: str,
+    ) -> bool:
+        """Simpan Q&A ke otak_memories untuk pembelajaran agent.
+
+        Content = 'Q: {question} | A: {answer}'
+        Metadata = {agent_type, question (original), hit_count: 1, created_at}
+
+        Args:
+            user_id: UUID tenant
+            agent_type: 'cs' | 'catat' | 'admin'
+            question: pertanyaan user
+            answer: jawaban dari LLM
+        """
+        uid = self._require_user_id(user_id)
+        if not agent_type or not question or not answer:
+            return False
+        norm_q = self._normalize_question(question)
+        if not norm_q or not (answer or "").strip():
+            return False
+        try:
+            # Cek apakah sudah ada (exact match)
+            existing = self.recall_memory(uid, agent_type, question)
+            if existing is not None:
+                logger.debug("remember_answer: already in memory")
+                return False
+            data = {
+                "user_id": uid,
+                "content": f"Q: {norm_q} | A: {answer.strip()}",
+                "embedding": [],  # placeholder; diisi kemudian via embedding service
+                "timestamp": datetime.now().isoformat(),
+                "feedback_score": 0.0,
+                "weight": 1.0,
+                "status": "active",
+                "metadata": {
+                    "agent_type": agent_type,
+                    "question": question,
+                    "hit_count": 1,
+                    "created_at": datetime.now().isoformat(),
+                },
+            }
+            self.supabase.table("otak_memories").insert(data).execute()
+            logger.info(
+                "remember_answer: stored user=%s agent=%s q='%s' (ans_len=%d)",
+                uid, agent_type, norm_q[:50], len(answer),
+            )
+            return True
+        except Exception as exc:
+            logger.error("remember_answer user=%s: %s", uid, exc)
+            return False
+
+    def get_memory_stats(self, user_id: str) -> dict:
+        """Statistik otak_memories per agent_type.
+
+        Returns: dict seperti
+            {
+              "cs":    {"count": 5, "total_weight": 5.4, "avg_score": 0.1},
+              "catat": {"count": 3, "total_weight": 3.0, "avg_score": 0.0},
+              "admin": {"count": 0, "total_weight": 0.0, "avg_score": 0.0},
+              "total": 8,
+            }
+        """
+        uid = self._require_user_id(user_id)
+        try:
+            res = (
+                self.supabase.table("otak_memories")
+                .select("metadata, weight, feedback_score, status")
+                .eq("user_id", uid)
+                .eq("status", "active")
+                .execute()
+            )
+            rows = res.data or []
+            stats: dict = {
+                "cs": {"count": 0, "total_weight": 0.0, "avg_score": 0.0},
+                "catat": {"count": 0, "total_weight": 0.0, "avg_score": 0.0},
+                "admin": {"count": 0, "total_weight": 0.0, "avg_score": 0.0},
+                "total": 0,
+            }
+            for r in rows:
+                meta = r.get("metadata") or {}
+                if not isinstance(meta, dict):
+                    continue
+                ag = meta.get("agent_type", "cs")
+                if ag not in stats or not isinstance(stats[ag], dict):
+                    stats[ag] = {"count": 0, "total_weight": 0.0, "avg_score": 0.0}
+                stats[ag]["count"] += 1
+                stats[ag]["total_weight"] += float(r.get("weight") or 0)
+                stats[ag]["avg_score"] += float(r.get("feedback_score") or 0)
+                stats["total"] += 1
+            # Hitung rata-rata score
+            for ag_key, ag_stat in stats.items():
+                if isinstance(ag_stat, dict) and ag_stat["count"] > 0:
+                    ag_stat["avg_score"] = round(ag_stat["avg_score"] / ag_stat["count"], 3)
+                    ag_stat["total_weight"] = round(ag_stat["total_weight"], 3)
+            return stats
+        except Exception as exc:
+            logger.error("get_memory_stats: %s", exc)
+            return {}
+
     def classify_wa_intent(self, text: str) -> str:
         """Klasifikasi intent pesan WA via Groq (AI utama)."""
         t = (text or "").strip()
