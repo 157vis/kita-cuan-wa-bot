@@ -1163,15 +1163,21 @@ class LarisCore:
         system = (
             "Anda router intent untuk asisten WhatsApp UMKM Indonesia. "
             'Balas HANYA JSON: {"intent":"..."} dengan intent salah satu dari: '
-            "CATAT, SKOR, SARAN, PIUTANG, HAPUS, LAINNYA.\n\n"
+            "CATAT, SKOR, SARAN, PIUTANG, HAPUS, STOK, PRODUK, LAPORAN, LAINNYA.\n\n"
             "CATAT = mencatat transaksi baru (jual/beli/bayar dengan nominal, atau catat piutang DENGAN nominal).\n"
             "SKOR = tanya skor/kesehatan bisnis.\n"
             "SARAN = minta saran/tips/evaluasi bisnis.\n"
             "PIUTANG = BERTANYA siapa yang belum bayar, daftar utang/piutang, cek outstanding — BUKAN mencatat.\n"
             "HAPUS = hapus transaksi terakhir.\n"
+            "STOK = tanya stok produk / inventory (mis. 'stok kopi berapa', 'gula masih ada?').\n"
+            "PRODUK = minta daftar produk / list barang yang dijual.\n"
+            "LAPORAN = minta laporan/rangkuman periode (mingguan/bulanan).\n"
             "LAINNYA = di luar kategori.\n\n"
             'Contoh PIUTANG: "siapa belum bayar utang", "siapa yang ngutang", "daftar piutang".\n'
             'Contoh CATAT: "jual kopi 5", "piutang pak budi 50000".\n'
+            'Contoh STOK: "stok indomie", "gula masih ada?", "berapa stok minyak".\n'
+            'Contoh PRODUK: "ada produk apa saja", "list barang", "menu lengkap".\n'
+            'Contoh LAPORAN: "laporan minggu ini", "rangkuman", "rekap penjualan".\n'
             "Pertanyaan utang/piutang TANPA nominal = PIUTANG, bukan CATAT."
         )
         try:
@@ -1187,7 +1193,7 @@ class LarisCore:
             )
             data = json.loads(res.choices[0].message.content or "{}")
             intent = str(data.get("intent", "LAINNYA")).strip().upper()
-            valid = {"CATAT", "SKOR", "SARAN", "PIUTANG", "HAPUS", "LAINNYA"}
+            valid = {"CATAT", "SKOR", "SARAN", "PIUTANG", "HAPUS", "STOK", "PRODUK", "LAPORAN", "LAINNYA"}
             return intent if intent in valid else "LAINNYA"
         except Exception as exc:
             logger.error("classify_wa_intent: %s", exc)
