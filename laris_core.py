@@ -624,6 +624,63 @@ class LarisCore:
         """Alias `db_insert_transaction` — selalu scoped per user_id."""
         return self.db_insert_transaction(user_id, type_txn, category, amount, note, is_prive=is_prive)
 
+    def record_income(
+        self, user_id: str, amount: int, source: str = "Lain-lain", note: str = ""
+    ) -> dict:
+        """Catat Pemasukan non-penjualan (gaji, modal, hibah, dll).
+
+        Method ini khusus untuk Shareen (AI Catat personal assistant).
+        Otomatis: category='Pemasukan Lain', type='Pemasukan'.
+
+        Returns dict dengan success status + receipt_no.
+        """
+        if not amount or amount <= 0:
+            return {"success": False, "error": "amount harus > 0"}
+        if amount > 1_000_000_000:
+            return {"success": False, "error": "amount terlalu besar (> 1M)"}
+        try:
+            category_map = {
+                "gaji": "Gaji",
+                "upah": "Gaji",
+                "penghasilan": "Gaji",
+                "pendapatan": "Pendapatan",
+                "modal": "Modal",
+                "bantuan": "Hibah",
+                "hibah": "Hibah",
+                "bonus": "Bonus",
+                "thr": "Bonus",
+                "honor": "Honor",
+                "fee": "Pendapatan",
+                "bunga": "Pendapatan",
+                "transferan": "Penerimaan",
+                "kiriman": "Penerimaan",
+                "laba": "Laba",
+                "profit": "Laba",
+            }
+            cat = category_map.get((source or "").lower(), "Pemasukan Lain")
+            note_full = (f"{source}: {note}" if source and note else (source or note or "Pemasukan via Shareen")).strip()
+            result = self.db_insert_transaction(
+                user_id=user_id,
+                type_txn="Pemasukan",
+                category=cat,
+                amount=amount,
+                note=note_full,
+                is_prive=False,
+            )
+            receipt = ""
+            if result and result.data:
+                receipt = str(result.data[0].get("receipt_no") or "")
+            return {
+                "success": True,
+                "amount": amount,
+                "category": cat,
+                "note": note_full,
+                "receipt_no": receipt,
+            }
+        except Exception as exc:
+            logger.error("record_income error user=%s: %s", user_id, exc)
+            return {"success": False, "error": str(exc)[:160]}
+
     def get_balance(self, user_id: str) -> float:
         """Saldo berjalan terakhir dari buku kas tenant."""
         uid = self._require_user_id(user_id)
@@ -1320,6 +1377,82 @@ class LarisCore:
             lv, ins = "low", ["Evaluasi biaya ⚠️", "Rapikan pencatatan 💪", "Kurangi stok mati 📉"]
         return {"score": total, "insight": random.choice(ins), "level": lv}
 
+    def get_keuangan_summary(self, user_id: str) -> dict:
+        """Ringkasan keuangan lengkap untuk user (Free tier safe — no Gudang/Produk).
+
+        Returns dict: {saldo, hari_ini, minggu_ini, bulan_ini, top_income, top_expense}
+        Dipakai Shareen untuk menjawab pertanyaan 'keuangan saya gimana'.
+        """
+        uid = self._require_user_id(user_id)
+        try:
+            resp = (
+                self.supabase.table("transactions")
+                .select("date, type, category, amount, note")
+                .eq("user_id", uid)
+                .order("date", desc=True)
+                .limit(2000)
+                .execute()
+            )
+            rows = resp.data or []
+            if not rows:
+                return {
+                    "saldo": 0, "hari_ini": 0, "minggu_ini": 0, "bulan_ini": 0,
+                    "total_income": 0, "total_expense": 0, "tx_count": 0,
+                    "top_income": [], "top_expense": [], "period": "all",
+                }
+            import pandas as pd
+            df = pd.DataFrame(rows)
+            df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+            df["date_dt"] = pd.to_datetime(df["date"], errors="coerce")
+            now = datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            week_ago = now - timedelta(days=7)
+            month_ago = now - timedelta(days=30)
+
+            hari_ini_total = df[df["date"].astype(str).str.startswith(today_str)]["amount"].sum()
+            minggu_ini_df = df[df["date_dt"] >= week_ago]
+            bulan_ini_df = df[df["date_dt"] >= month_ago]
+            income_df = df[df["type"] == "Pemasukan"]
+            expense_df = df[df["type"] == "Pengeluaran"]
+            total_income = float(income_df["amount"].sum())
+            total_expense = float(expense_df["amount"].sum())
+            saldo = total_income - total_expense
+
+            # Top 3 income & expense
+            top_income = []
+            if not income_df.empty:
+                top = income_df.groupby("category")["amount"].sum().nlargest(3)
+                top_income = [(str(cat), float(amt)) for cat, amt in top.items()]
+            top_expense = []
+            if not expense_df.empty:
+                top = expense_df.groupby("category")["amount"].sum().nlargest(3)
+                top_expense = [(str(cat), float(amt)) for cat, amt in top.items()]
+
+            minggu_in_total = float(minggu_ini_df[minggu_ini_df["type"] == "Pemasukan"]["amount"].sum())
+            minggu_out_total = float(minggu_ini_df[minggu_ini_df["type"] == "Pengeluaran"]["amount"].sum())
+
+            return {
+                "saldo": saldo,
+                "hari_ini": float(hari_ini_total),
+                "minggu_ini_in": minggu_in_total,
+                "minggu_ini_out": minggu_out_total,
+                "minggu_ini_net": minggu_in_total - minggu_out_total,
+                "bulan_ini_in": float(bulan_ini_df[bulan_ini_df["type"] == "Pemasukan"]["amount"].sum()),
+                "bulan_ini_out": float(bulan_ini_df[bulan_ini_df["type"] == "Pengeluaran"]["amount"].sum()),
+                "total_income": total_income,
+                "total_expense": total_expense,
+                "tx_count": len(df),
+                "top_income": top_income,
+                "top_expense": top_expense,
+            }
+        except Exception as exc:
+            logger.error("get_keuangan_summary user=%s: %s", uid, exc)
+            return {
+                "saldo": 0, "hari_ini": 0, "minggu_ini": 0, "bulan_ini": 0,
+                "total_income": 0, "total_expense": 0, "tx_count": 0,
+                "top_income": [], "top_expense": [], "error": str(exc)[:120],
+            }
+
     # --------------------
     # AI Memory — incremental learning untuk CS & Catat agents
     # --------------------
@@ -1510,21 +1643,23 @@ class LarisCore:
         system = (
             "Anda router intent untuk asisten WhatsApp UMKM Indonesia. "
             'Balas HANYA JSON: {"intent":"..."} dengan intent salah satu dari: '
-            "CATAT, SKOR, SARAN, PIUTANG, HAPUS, STOK, PRODUK, LAPORAN, LAINNYA.\n\n"
-            "CATAT = mencatat transaksi baru (jual/beli/bayar dengan nominal, atau catat piutang DENGAN nominal).\n"
+            "CATAT, GREETING, SKOR, SARAN, PIUTANG, HAPUS, STOK, PRODUK, LAPORAN, LAINNYA.\n\n"
+            "CATAT = mencatat transaksi baru (jual/beli/bayar/gaji/pemasukan/modal dengan nominal, atau catat piutang DENGAN nominal).\n"
+            "GREETING = sapaan / perkenalan / panggil nama bot (halo, hai, pagi, shareen, dll).\n"
             "SKOR = tanya skor/kesehatan bisnis.\n"
             "SARAN = minta saran/tips/evaluasi bisnis.\n"
             "PIUTANG = BERTANYA siapa yang belum bayar, daftar utang/piutang, cek outstanding — BUKAN mencatat.\n"
             "HAPUS = hapus transaksi terakhir.\n"
             "STOK = tanya stok produk / inventory (mis. 'stok kopi berapa', 'gula masih ada?').\n"
             "PRODUK = minta daftar produk / list barang yang dijual.\n"
-            "LAPORAN = minta laporan/rangkuman periode (mingguan/bulanan).\n"
+            "LAPORAN = minta laporan/rangkuman keuangan/saldo/keuangan (mingguan/bulanan/harian).\n"
             "LAINNYA = di luar kategori.\n\n"
+            'Contoh GREETING: "halo", "selamat pagi", "shareen", "hai".\n'
             'Contoh PIUTANG: "siapa belum bayar utang", "siapa yang ngutang", "daftar piutang".\n'
-            'Contoh CATAT: "jual kopi 5", "piutang pak budi 50000".\n'
+            'Contoh CATAT: "jual kopi 5", "piutang pak budi 50000", "gaji bulanan 3jt", "dapat modal 5jt dari ibu".\n'
             'Contoh STOK: "stok indomie", "gula masih ada?", "berapa stok minyak".\n'
             'Contoh PRODUK: "ada produk apa saja", "list barang", "menu lengkap".\n'
-            'Contoh LAPORAN: "laporan minggu ini", "rangkuman", "rekap penjualan".\n'
+            'Contoh LAPORAN: "laporan minggu ini", "rangkuman", "rekap penjualan", "saldo saya berapa", "keuangan saya gimana".\n'
             "Pertanyaan utang/piutang TANPA nominal = PIUTANG, bukan CATAT."
         )
         try:
@@ -1540,7 +1675,7 @@ class LarisCore:
             )
             data = json.loads(res.choices[0].message.content or "{}")
             intent = str(data.get("intent", "LAINNYA")).strip().upper()
-            valid = {"CATAT", "SKOR", "SARAN", "PIUTANG", "HAPUS", "STOK", "PRODUK", "LAPORAN", "LAINNYA"}
+            valid = {"CATAT", "GREETING", "SKOR", "SARAN", "PIUTANG", "HAPUS", "STOK", "PRODUK", "LAPORAN", "LAINNYA"}
             return intent if intent in valid else "LAINNYA"
         except Exception as exc:
             logger.error("classify_wa_intent: %s", exc)

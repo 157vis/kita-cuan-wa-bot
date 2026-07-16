@@ -5,6 +5,7 @@ import asyncio
 import base64
 import os
 import random
+import re
 
 import httpx
 from fastapi import FastAPI, Request
@@ -33,16 +34,20 @@ from agents import (  # noqa: E402
 from bot_helpers import (  # noqa: E402
     BOT_NAME,
     bot_header,
+    build_welcome_message,
+    detect_intent_rules,
     extract_incoming,
     get_greeting,
     is_duplicate_inbound,
+    is_greeting_or_intro,
+    is_laporan_keuangan,
     is_likely_record_command,
     is_outgoing_or_bot_echo,
+    is_stok_or_produk_query,
     parse_webhook_body,
     random_confirm,
     random_typing_delay,
     sanitize_intent,
-    detect_intent_rules,
 )
 from config import BOT_LOGIC_VERSION, REORDER_QTY, STOCK_THRESHOLD  # noqa: E402
 from fonnte_client import FonnteClient  # noqa: E402
@@ -163,6 +168,58 @@ def _orchestrate(user_id: str, raw_text: str, data: list[dict]) -> str:
         stock_threshold=STOCK_THRESHOLD,
         reorder_qty=REORDER_QTY,
     )
+
+
+def _format_keuangan_report(ks: dict) -> str:
+    """Format laporan keuangan dari dict hasil get_keuangan_summary()."""
+    if not ks or ks.get("error"):
+        return (
+            f"{bot_header()}\n\n📊 Belum ada catatan keuangan.\n\n"
+            f"Mulai catat dengan: _jual kopi 50rb_ atau _gaji 3jt_ 💰"
+        )
+    saldo = float(ks.get("saldo", 0) or 0)
+    hari_ini = float(ks.get("hari_ini", 0) or 0)
+    minggu_in = float(ks.get("minggu_ini_in", 0) or 0)
+    minggu_out = float(ks.get("minggu_ini_out", 0) or 0)
+    bulan_in = float(ks.get("bulan_ini_in", 0) or 0)
+    bulan_out = float(ks.get("bulan_ini_out", 0) or 0)
+    total_in = float(ks.get("total_income", 0) or 0)
+    total_out = float(ks.get("total_expense", 0) or 0)
+    tx_count = int(ks.get("tx_count", 0) or 0)
+    top_in = ks.get("top_income", []) or []
+    top_out = ks.get("top_expense", []) or []
+
+    def rp(n: float) -> str:
+        return f"Rp {int(n):,}".replace(",", ".")
+
+    lines = ["📊 *Kondisi Keuangan Anda*", ""]
+    lines.append(f"💰 *Saldo Saat Ini*: {rp(saldo)}")
+    if hari_ini > 0:
+        lines.append(f"📅 Hari Ini: {rp(hari_ini)}")
+    lines.append("")
+    lines.append(f"📈 *7 Hari Terakhir*:")
+    lines.append(f"   Masuk: {rp(minggu_in)}")
+    lines.append(f"   Keluar: {rp(minggu_out)}")
+    lines.append(f"   _Net: {rp(minggu_in - minggu_out)}_")
+    lines.append("")
+    lines.append(f"📅 *30 Hari Terakhir*:")
+    lines.append(f"   Masuk: {rp(bulan_in)}")
+    lines.append(f"   Keluar: {rp(bulan_out)}")
+    lines.append("")
+    if top_in:
+        lines.append("🥇 *Pemasukan Terbesar*:")
+        for cat, amt in top_in[:3]:
+            lines.append(f"   • {cat}: {rp(amt)}")
+        lines.append("")
+    if top_out:
+        lines.append("💸 *Pengeluaran Terbesar*:")
+        for cat, amt in top_out[:3]:
+            lines.append(f"   • {cat}: {rp(amt)}")
+        lines.append("")
+    lines.append(f"📝 Total transaksi tercatat: {tx_count}")
+    lines.append("")
+    lines.append("_Ketik 'halo' atau 'shareen' kapan saja untuk mulai lagi_ ✨")
+    return f"{bot_header()}\n\n" + "\n".join(lines)
 
 
 def _csat_base_url() -> str:
@@ -639,14 +696,34 @@ async def webhook(request: Request):
             logged = _persist_wa_log(phone, text, reply, user_id=csat_tenant)
             return {"status": "ok", "mode": "cs_fallback", "wa_logged": logged}
 
-    # === OWNER ROUTE — halo/ping check ===
+    # === OWNER ROUTE — Shareen (AI Catat personal assistant) ===
     # Hanya sampai sini kalau pengirim adalah owner (atau nomor tidak dikenal +
     # device kosong + tidak ada text — kasus langka yang tidak akan masuk CS).
     logger.warning(
         "ROUTE DEBUG: masuk OWNER ROUTE block. _user_id_for_route=%s, text=%r, text.lower=%r",
         _user_id_for_route, text, (text or "").lower(),
     )
-    if text and text.lower() in ("test", "ping", "tes", "halo", "hi"):
+
+    # === GREETING: sapaan hidup dari Shareen ===
+    if text and is_greeting_or_intro(text):
+        try:
+            _core_w = get_core()
+            tier = _core_w.get_plan_tier(_user_id_for_route) if _user_id_for_route else "free"
+            biz = ""
+            await asyncio.sleep(random.uniform(0.5, 1.2))
+            welcome = build_welcome_message(plan_tier=tier, business_name=biz)
+            await send_wa_reply(phone, welcome, inboxid=inboxid, device=device)
+            _persist_wa_log(phone, text, welcome)
+            return {"status": "ok", "mode": "shareen_greeting", "wa_logged": True}
+        except Exception as exc:
+            logger.exception("shareen greeting failed: %s", exc)
+            # fallback simple
+            greeting = get_greeting()
+            reply = f"{greeting}! 👋 Saya Shareen, asisten pribadi Anda. Mau catat apa hari ini?"
+            await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
+            return {"status": "ok", "mode": "shareen_greeting_fallback"}
+
+    if text and text.lower() in ("test", "ping", "tes"):
         greeting = get_greeting()
         reply = (
             f"{greeting}! 👋\n\n"
@@ -716,14 +793,59 @@ async def webhook(request: Request):
             intent = sanitize_intent(text, await detect_intent(text), classify_wa_intent)
             logger.debug("intent=%r text=%r", intent, text[:80])
 
+            # === Shareen GREETING fallback (kalau owner-sapaan masuk lewat path biasa) ===
+            if intent == "GREETING" or is_greeting_or_intro(text):
+                try:
+                    _core_g = get_core()
+                    tier = _core_g.get_plan_tier(user_id) if user_id else "free"
+                    welcome = build_welcome_message(plan_tier=tier, business_name="")
+                    reply = f"{bot_header()}\n\n{welcome}"
+                    await asyncio.sleep(random.uniform(0.5, 1.2))
+                    await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
+                    _persist_wa_log(phone, text, reply)
+                    return {"status": "ok", "mode": "shareen_greeting_v2", "wa_logged": True}
+                except Exception as exc:
+                    logger.exception("shareen greeting v2 failed: %s", exc)
+                    reply = f"{bot_header()}\n\n{get_greeting()}! 👋 Saya Shareen, asisten pribadi Anda."
+                    await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
+                    return {"status": "ok", "mode": "shareen_greeting_fallback"}
+
             if intent == "CATAT" and is_likely_record_command(text):
                 data = ai_extractor_agent(text)
                 if not data:
-                    reply = (
-                        f"{bot_header()}\n\n"
-                        f"Hmm, aku belum nangkep transaksinya 🤔\n"
-                        f"Coba: _jual kopi 50rb_ atau _beli minyak 18000_"
-                    )
+                    # === Fallback khusus Shareen: Pemasukan sederhana (gaji, modal) ===
+                    try:
+                        m = re.search(r"(?:gaji|upah|penghasilan|pendapatan|pemasukan|masuk|modal|bantuan|bonus|thr|honor|fee|terima|dapat|bunga|laba|profit|kiriman|transferan)\s+([0-9][0-9.,]*(?:rb|ribu|jt|juta|k)?)", (text or "").lower())
+                        if m and (re.search(r"\b(gaji|upah|penghasilan|pendapatan|pemasukan|modal|bantuan|bonus|thr|honor|fee|terima|dapat|bunga|laba|profit|kiriman|transferan)\b", (text or "").lower())):
+                            raw = m.group(1).lower().replace("rb", "").replace("ribu", "").replace("jt", "000000").replace("juta", "000000").replace("k", "000").replace(".", "").replace(",", "")
+                            try:
+                                amt = int(float(raw))
+                                # Tentukan source dari kata pertama yang match
+                                source_m = re.search(r"(gaji|upah|penghasilan|pendapatan|pemasukan|modal|bantuan|bonus|thr|honor|fee|terima|dapat|bunga|laba|profit|kiriman|transferan)", (text or "").lower())
+                                source = source_m.group(1) if source_m else "Lain-lain"
+                                res = core.record_income(user_id, amt, source=source, note=text)
+                                if res.get("success"):
+                                    receipt = res.get("receipt_no", "")
+                                    reply = (
+                                        f"{bot_header()}\n\n"
+                                        f"✨ *Pemasukan Tercatat!*\n\n"
+                                        f"📥 *{source.title()}*: Rp {int(amt):,}".replace(",", ".") + "\n"
+                                        f"📁 Kategori: {res.get('category', 'Pemasukan Lain')}\n"
+                                        f"🧾 {BOT_NAME}: {receipt}\n\n"
+                                        f"_Saldo kamu terus bertambah. Terus semangat, bos! 💪_"
+                                    )
+                                else:
+                                    raise RuntimeError(res.get("error", "unknown"))
+                            except (ValueError, TypeError):
+                                pass  # fallback ke pesan default
+                    except Exception:
+                        pass
+                    if "Pemasukan Tercatat" not in (reply or ""):
+                        reply = (
+                            f"{bot_header()}\n\n"
+                            f"Hmm, aku belum nangkep transaksinya 🤔\n"
+                            f"Coba: _jual kopi 50rb_, _beli minyak 18rb_, _gaji bulanan 3jt_"
+                        )
                 else:
                     for row in data:
                         is_prv = "prive" in str(row.get("category", "")).lower()
@@ -764,82 +886,91 @@ async def webhook(request: Request):
                     reply = f"{bot_header()}\n\nHmm, nggak ada transaksi yg bisa dihapus nih 🤔"
 
             elif intent == "STOK":
-                # Tampilkan produk dengan stok terendah / habis (sesuai design STOK)
-                products = core.list_products(user_id, active_only=True) if hasattr(core, "list_products") else []
-                if not products:
-                    reply = (
-                        f"{bot_header()}\n\n📦 Belum ada produk terdaftar.\n\n"
-                        f"Tambah produk di dashboard dulu ya~"
-                    )
+                # Plan gate: Free user tidak boleh akses stok/gudang (kecuali sudah Pro/Bisnis/Kemitraan)
+                try:
+                    _tier_s = core.get_plan_tier(user_id) if user_id else "free"
+                except Exception:
+                    _tier_s = "free"
+                if _tier_s == "free":
+                    # Tampilkan laporan keuangan (pengganti)
+                    try:
+                        ks = core.get_keuangan_summary(user_id) if user_id else {}
+                        reply = _format_keuangan_report(ks)
+                    except Exception:
+                        reply = (
+                            f"{bot_header()}\n\n"
+                            f"🔒 *Fitur Stok/Produk khusus paket Pro*\n\n"
+                            f"Saya kasih ringkasan keuangan kamu dulu ya:\n"
+                            f"Balas _laporan_ untuk lihat lengkap 💰"
+                        )
                 else:
-                    lines = ["📦 *Stok Produk*", ""]
-                    # Sort by stock ASC: yang paling kritis di atas
-                    sorted_p = sorted(products, key=lambda p: (p.get("stock", 0) or 0, p.get("name", "").lower()))
-                    for p in sorted_p[:15]:  # max 15 baris
-                        name = p.get("name", "?")
-                        stock = p.get("stock", 0) or 0
-                        if stock <= 0:
-                            emoji = "🔴"
-                            label = "HABIS"
-                        elif stock <= 5:
-                            emoji = "🟡"
-                            label = f"{stock} (tipis)"
-                        else:
-                            emoji = "🟢"
-                            label = str(stock)
-                        lines.append(f"{emoji} {name} — {label}")
-                    reply = f"{bot_header()}\n\n" + "\n".join(lines)
+                    # Pro/Bisnis: tampilkan stok penuh
+                    products = core.list_products(user_id, active_only=True) if hasattr(core, "list_products") else []
+                    if not products:
+                        reply = (
+                            f"{bot_header()}\n\n📦 Belum ada produk terdaftar.\n\n"
+                            f"Tambah produk di dashboard dulu ya~"
+                        )
+                    else:
+                        lines = ["📦 *Stok Produk*", ""]
+                        sorted_p = sorted(products, key=lambda p: (p.get("stock", 0) or 0, p.get("name", "").lower()))
+                        for p in sorted_p[:15]:
+                            name = p.get("name", "?")
+                            stock = p.get("stock", 0) or 0
+                            if stock <= 0:
+                                emoji = "🔴"
+                                label = "HABIS"
+                            elif stock <= 5:
+                                emoji = "🟡"
+                                label = f"{stock} (tipis)"
+                            else:
+                                emoji = "🟢"
+                                label = str(stock)
+                            lines.append(f"{emoji} {name} — {label}")
+                        reply = f"{bot_header()}\n\n" + "\n".join(lines)
 
             elif intent == "PRODUK":
-                # List semua produk (aktif)
-                products = core.list_products(user_id, active_only=False) if hasattr(core, "list_products") else []
-                if not products:
-                    reply = (
-                        f"{bot_header()}\n\n📋 Belum ada produk.\n\n"
-                        f"Tambah produk di dashboard dulu ya~"
-                    )
+                # Plan gate: Free user tidak boleh akses list produk
+                try:
+                    _tier_p = core.get_plan_tier(user_id) if user_id else "free"
+                except Exception:
+                    _tier_p = "free"
+                if _tier_p == "free":
+                    try:
+                        ks = core.get_keuangan_summary(user_id) if user_id else {}
+                        reply = _format_keuangan_report(ks)
+                    except Exception:
+                        reply = (
+                            f"{bot_header()}\n\n"
+                            f"🔒 *Daftar Produk khusus paket Pro*\n\n"
+                            f"Sementara ini saya tampilkan kondisi keuangan kamu aja ya 💰"
+                        )
                 else:
-                    lines = ["📋 *Daftar Produk*", ""]
-                    for i, p in enumerate(products[:20], start=1):
-                        name = p.get("name", "?")
-                        price = p.get("price", 0) or 0
-                        stock = p.get("stock", 0) or 0
-                        is_active = p.get("is_active", True)
-                        marker = "" if is_active else " _(non-aktif)_"
-                        price_str = f"Rp {price:,.0f}".replace(",", ".")
-                        lines.append(f"{i}. {name} — {price_str} (stok: {stock}){marker}")
-                    reply = f"{bot_header()}\n\n" + "\n".join(lines)
+                    products = core.list_products(user_id, active_only=False) if hasattr(core, "list_products") else []
+                    if not products:
+                        reply = (
+                            f"{bot_header()}\n\n📋 Belum ada produk.\n\n"
+                            f"Tambah produk di dashboard dulu ya~"
+                        )
+                    else:
+                        lines = ["📋 *Daftar Produk*", ""]
+                        for i, p in enumerate(products[:20], start=1):
+                            name = p.get("name", "?")
+                            price = p.get("price", 0) or 0
+                            stock = p.get("stock", 0) or 0
+                            is_active = p.get("is_active", True)
+                            marker = "" if is_active else " _(non-aktif)_"
+                            price_str = f"Rp {price:,.0f}".replace(",", ".")
+                            lines.append(f"{i}. {name} — {price_str} (stok: {stock}){marker}")
+                        reply = f"{bot_header()}\n\n" + "\n".join(lines)
 
             elif intent == "LAPORAN":
-                # Rangkuman 7 hari terakhir
+                # SELALU tampilkan laporan keuangan — tidak di-gate
                 try:
-                    df = get_dashboard_data(user_id)
-                    summary_lines = ["📊 *Laporan 7 Hari Terakhir*", ""]
-                    if df is None or df.empty:
-                        summary_lines.append("Belum ada transaksi 7 hari terakhir nih.")
-                    else:
-                        # Hitung total in/out dari kolom 'type' atau 'amount' (sesuai schema)
-                        try:
-                            if "type" in df.columns and "amount" in df.columns:
-                                in_df = df[df["type"].astype(str).str.lower().isin(["in", "income", "masuk", "pemasukan"])]
-                                out_df = df[df["type"].astype(str).str.lower().isin(["out", "expense", "keluar", "pengeluaran"])]
-                                total_in = float(in_df["amount"].sum()) if not in_df.empty else 0.0
-                                total_out = float(out_df["amount"].sum()) if not out_df.empty else 0.0
-                            else:
-                                total_in = 0.0
-                                total_out = 0.0
-                        except Exception:
-                            total_in = 0.0
-                            total_out = 0.0
-                        profit = total_in - total_out
-                        summary_lines.append(f"💰 Pemasukan: Rp {total_in:,.0f}".replace(",", "."))
-                        summary_lines.append(f"💸 Pengeluaran: Rp {total_out:,.0f}".replace(",", "."))
-                        summary_lines.append(f"📈 Margin: Rp {profit:,.0f}".replace(",", "."))
-                        summary_lines.append("")
-                        summary_lines.append(f"📝 Total transaksi: {len(df)}")
-                    reply = f"{bot_header()}\n\n" + "\n".join(summary_lines)
+                    ks = core.get_keuangan_summary(user_id) if user_id else {}
+                    reply = _format_keuangan_report(ks)
                 except Exception as exc:
-                    logger.exception("LAPORAN error: %s", exc)
+                    logger.exception("LAPORAN keuangan_summary error: %s", exc)
                     reply = (
                         f"{bot_header()}\n\n😅 Waduh, gagal ambil data laporan.\n"
                         f"Coba lagi nanti ya~"

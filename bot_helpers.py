@@ -17,8 +17,9 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-BOT_NAME = "Laris"
-BOT_EMOJI = "🛒"
+BOT_NAME = "Shareen"  # AI Catat personal assistant name
+BOT_EMOJI = "✨"
+BOT_TAGLINE = "asisten pribadi pembukuan Anda"
 
 BOT_TEXT_MARKERS = (
     "tercatat!",
@@ -51,7 +52,7 @@ def bot_header() -> str:
 
 
 def get_greeting() -> str:
-    """Sapaan berdasarkan jam lokal."""
+    """Sapaan berdasarkan jam lokal (WIB)."""
     hour = datetime.now().hour
     if 5 <= hour < 11:
         return "Selamat pagi"
@@ -60,6 +61,48 @@ def get_greeting() -> str:
     if 15 <= hour < 18:
         return "Selamat sore"
     return "Selamat malam"
+
+
+def build_welcome_message(plan_tier: str = "free", business_name: str = "") -> str:
+    """Sapaan hidup untuk client baru / first-time chat.
+
+    Tier-aware:
+    - Free: full fitur AI Catat + laporan keuangan, TAPI Gudang/Produk dikunci
+    - Pro+: full fitur + Gudang/Produk unlocked
+    """
+    greeting = get_greeting()
+    name_part = f" *{business_name}* " if business_name else " "
+    features = (
+        f"📝 *Catat Pemasukan* — gaji, hasil jualan, modal masuk, dll\n"
+        f"💸 *Catat Pengeluaran* — beli stok, bayar listrik, transport, dll\n"
+        f"📊 *Laporan Keuangan* — saldo, omzet, ringkasan harian/mingguan\n"
+        f"🗑️ *Hapus transaksi* — kalau salah ketik\n"
+        f"💡 *Skor Bisnis* — cek kesehatan toko kamu"
+    )
+    if plan_tier in ("pro", "bisnis", "kemitraan"):
+        features += (
+            f"\n\n✨ *Pro Unlocked*:\n"
+            f"📦 *Kelola Gudang* — tambah produk, cek stok\n"
+            f"💬 *AI CS Agent* — saya jawabin chat customer masuk 24/7\n"
+            f"🧠 *AI Memory* — saya belajar dari setiap percakapan"
+        )
+    else:
+        features += (
+            f"\n\n🔒 *Tersimpan untuk paket Pro*:\n"
+            f"📦 Kelola Gudang & Produk\n"
+            f"💬 AI CS Agent (layani customer otomatis 24/7)\n"
+            f"💡 _Upgrade ke Pro kapan saja lewat dashboard_"
+        )
+
+    return (
+        f"{greeting}! 👋\n\n"
+        f"Saya *{BOT_NAME}* — {BOT_TAGLINE}{name_part}😊\n\n"
+        f"*Apa yang bisa saya bantu hari ini?*\n\n"
+        f"{features}\n\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"_Contoh:_ jual kopi 50rb · beli stok 200rb · gaji bulanan 3jt\n"
+        f"Ketik _shareen_ kapan saja untuk lihat menu ini lagi 💬"
+    )
 
 
 def random_confirm(data: list[dict]) -> str:
@@ -139,7 +182,10 @@ def is_hapus_command(text: str) -> bool:
 
 
 def is_likely_record_command(text: str) -> bool:
-    """True jika pesan benar-benar perintah catat transaksi."""
+    """True jika pesan benar-benar perintah catat transaksi.
+
+    Termasuk: jual, beli, gaji, pemasukan, modal, dll.
+    """
     if is_debt_inquiry(text) or is_skor_inquiry(text) or is_saran_inquiry(text) or is_hapus_command(text):
         return False
     t = (text or "").strip().lower()
@@ -147,7 +193,61 @@ def is_likely_record_command(text: str) -> bool:
         return True
     if ("piutang" in t or "utang" in t or "prive" in t or "bayar" in t) and re.search(r"\d", t):
         return "belum bayar" not in t
+    # === Tambah: deteksi kata Pemasukan (gaji, modal, dll) ===
+    income_keywords = (
+        "gaji", "upah", "penghasilan", "pendapatan", "pemasukan", "masuk",
+        "terima", "dapat", "modal", "bantuan", "transferan", "kiriman",
+        "bunga", "profit", "laba", "bonus", "thr", "honor", "fee",
+    )
+    if any(kw in t for kw in income_keywords) and re.search(r"\d", t):
+        return True
     return False
+
+
+def is_greeting_or_intro(text: str) -> bool:
+    """True untuk sapaan / panggil nama bot (welcome message).
+
+    Ketat: hanya untuk pesan PENDEK (≤4 kata) tanpa angka/nominal.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    # Wajib tanpa angka (kalau ada nominal, itu CATAT, bukan sapaan)
+    if re.search(r"\d", t):
+        return False
+    words = t.split()
+    if len(words) > 5:
+        return False
+    # Harus seluruhnya salah satu dari kosa kata sapaan
+    greetings = (
+        "halo", "hai", "hi", "hello", "selamat", "pagi", "siang",
+        "sore", "malam", "shareen", "assalamualaikum", "wr", "wb",
+        "permisi", "p",
+    )
+    # Cocokkan jika ada minimal satu kata greeting atau nama bot
+    has_greet = any(w in greetings or any(g in w for g in ("selamat", "halo")) for w in words)
+    return has_greet
+
+
+def is_laporan_keuangan(text: str) -> bool:
+    """True untuk permintaan laporan keuangan / ringkasan."""
+    t = (text or "").strip().lower()
+    keywords = (
+        "laporan", "report", "ringkasan", "rekap", "saldo", "keuangan",
+        "uang saya", "uangku", "keadaan", "kondisi", "omzet", "untung",
+        "rugi", "profit", "cuanku", "buku kas", "mutasi",
+    )
+    return any(kw in t for kw in keywords)
+
+
+def is_stok_or_produk_query(text: str) -> bool:
+    """True untuk query stok/produk (GATED untuk free)."""
+    t = (text or "").strip().lower()
+    keywords = (
+        "stok", "stock", "produk", "product", "barang", "gudang",
+        "daftar barang", "list barang", "katalog",
+    )
+    return any(kw in t for kw in keywords)
 
 
 def detect_intent_rules(text: str) -> str | None:
@@ -165,7 +265,20 @@ def detect_intent_rules(text: str) -> str | None:
         return "HAPUS"
     if any(kw in t for kw in ("hapus transaksi", "hapus terakhir", "batal transaksi", "undo")):
         return "HAPUS"
+    # === BARU: Sapaan / perkenalan → welcome message ===
+    if is_greeting_or_intro(t):
+        return "GREETING"
+    # === BARU: Query stok/produk ===
+    if is_stok_or_produk_query(t):
+        return "STOK"
+    # === BARU: Laporan keuangan ===
+    if is_laporan_keuangan(t):
+        return "LAPORAN"
     if re.search(r"\b(jual|beli)\b", t) and re.search(r"\d", t):
+        return "CATAT"
+    # === Tambah: rule-based untuk kata "gaji" / pemasukan (skip LLM) ===
+    income_kw = ("gaji", "upah", "penghasilan", "pemasukan", "masuk", "modal", "bonus", "thr", "honor")
+    if any(kw in t for kw in income_kw) and re.search(r"\d", t):
         return "CATAT"
     return None
 
