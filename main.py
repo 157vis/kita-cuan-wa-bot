@@ -465,6 +465,10 @@ async def webhook(request: Request):
     # Device Fonnte yang menerima pesan (untuk multi-tenant: kirim balasan
     # via device toko, bukan via device customer)
     device = body.get("device") or body.get("sender_device")
+    logger.warning(
+        "WEBHOOK DEBUG: phone=%s device=%s body.device=%r body.sender_device=%r body.keys=%s",
+        phone, device, body.get("device"), body.get("sender_device"), list(body.keys()),
+    )
 
     if not phone:
         logger.error("webhook: nomor tidak ditemukan. body=%s", str(body)[:500])
