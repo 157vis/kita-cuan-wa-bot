@@ -216,6 +216,94 @@ class LarisCore:
         payload["updated_at"] = datetime.now().isoformat()
         return self.supabase.table("client_settings").upsert(payload, on_conflict="user_id").execute()
 
+    # ============================================================
+    # Plan / Tier — enable/disable fitur berdasarkan subscription
+    # ============================================================
+    PLAN_TIERS = ("free", "pro", "bisnis", "kemitraan")
+
+    def get_plan_tier(self, user_id: str) -> str:
+        """Ambil plan_tier user dari tabel clients.
+
+        Returns salah satu dari: 'free', 'pro', 'bisnis', 'kemitraan'.
+        Default 'free' kalau row tidak ada atau plan_expires_at sudah lewat.
+
+        Opsi C (sesuai strategi user): tidak ada counter. Hanya deteksi tier.
+        """
+        uid = self.normalize_user_id(user_id)
+        if not uid:
+            return "free"
+        try:
+            resp = (
+                self.supabase.table("clients")
+                .select("plan_tier, plan_expires_at, is_active")
+                .eq("user_id", uid)
+                .limit(1)
+                .execute()
+            )
+            rows = resp.data or []
+            if not rows:
+                return "free"
+            tier = str(rows[0].get("plan_tier") or "free").strip().lower()
+            if tier not in self.PLAN_TIERS:
+                tier = "free"
+            # Auto-downgrade ke free kalau plan_expires_at < NOW()
+            expires_at = rows[0].get("plan_expires_at")
+            if expires_at and tier != "free":
+                try:
+                    exp_str = expires_at.replace("Z", "+00:00")
+                    exp_dt = datetime.fromisoformat(exp_str)
+                    now = datetime.now(datetime.timezone.utc)
+                    if exp_dt.tzinfo is None:
+                        exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
+                    if exp_dt < now:
+                        logger.info(
+                            "get_plan_tier: plan %s sudah expire untuk user=%s, auto-free",
+                            tier, uid,
+                        )
+                        tier = "free"
+                except Exception as exc:
+                    logger.debug("get_plan_tier: parse expires_at gagal: %s", exc)
+            # Kalau client non-aktif, treat sebagai free
+            if rows[0].get("is_active") is False and tier != "kemitraan":
+                tier = "free"
+            return tier
+        except Exception as exc:
+            logger.error("get_plan_tier user=%s: %s", uid, exc)
+            return "free"
+
+    def is_premium_feature_allowed(self, user_id: str, feature: str) -> bool:
+        """Cek apakah user boleh pakai fitur premium.
+
+        Args:
+            user_id: UUID tenant
+            feature: salah satu dari:
+                - 'cs_agent'        -> CS Agent 24/7 untuk customer
+                - 'vision'          -> AI Vision (scan struk foto)
+                - 'voice'           -> AI Voice note
+                - 'custom_branding' -> Logo + warna di laporan
+                - 'multi_branch'    -> Multi-toko (3 cabang)
+                - 'api_access'      -> API untuk integrasi
+
+        Returns True kalau tier user boleh pakai fitur tsb.
+        """
+        tier = self.get_plan_tier(user_id)
+        allowed_by_tier = {
+            "free":       {"cs_agent": False, "vision": False, "voice": False,
+                           "custom_branding": False, "multi_branch": False,
+                           "api_access": False},
+            "pro":        {"cs_agent": True,  "vision": True,  "voice": True,
+                           "custom_branding": False, "multi_branch": False,
+                           "api_access": False},
+            "bisnis":     {"cs_agent": True,  "vision": True,  "voice": True,
+                           "custom_branding": True,  "multi_branch": True,
+                           "api_access": True},
+            "kemitraan":  {"cs_agent": True,  "vision": True,  "voice": True,
+                           "custom_branding": True,  "multi_branch": True,
+                           "api_access": True},
+        }
+        rules = allowed_by_tier.get(tier, allowed_by_tier["free"])
+        return bool(rules.get(feature, False))
+
     @staticmethod
     def slugify_client_id(label: str, email: str = "") -> str:
         """Buat client_id aman untuk BukuWarung dari nama usaha atau email."""
@@ -367,7 +455,15 @@ class LarisCore:
         )
 
     def resolve_user_id_by_phone(self, phone: str) -> str:
-        """Petakan nomor WA ke user_id Supabase (routing webhook — butuh service role)."""
+        """Petakan nomor WA ke user_id Supabase (routing webhook — butuh service role).
+
+        Behavior:
+            - Nomor ADA di wa_users → return user_id-nya.
+            - Nomor TIDAK ADA di wa_users → raise ValueError (customer, bukan owner).
+              JANGAN fallback ke WA_DEFAULT_USER_ID, karena itu akan membuat
+              pesan customer diproses sebagai owner -> balasan "Admin AI"
+              alih-alih di-forward ke CS Multi-Agent.
+        """
         self._assert_service_client("resolve_user_id_by_phone")
         normalized = self.normalize_phone(phone)
 
@@ -382,12 +478,13 @@ class LarisCore:
             if resp.data:
                 return resp.data[0]["user_id"]
 
-        default_user = os.environ.get("WA_DEFAULT_USER_ID")
-        if default_user:
-            return default_user
-
+        # Nomor tidak ditemukan di wa_users. Ini CUSTOMER, bukan owner.
+        # Caller (webhook handler) akan route pesan ke CS Multi-Agent.
+        # JANGAN fallback ke WA_DEFAULT_USER_ID — itu untuk development/testing saja
+        # dan akan salah route customer sebagai owner.
         raise ValueError(
-            f"Nomor {phone} belum terdaftar. Hubungkan di dashboard atau set WA_DEFAULT_USER_ID."
+            f"Nomor {phone} belum terdaftar di wa_users. "
+            "Pesan akan di-forward ke CS Multi-Agent sebagai customer."
         )
 
     def probe_table(self, table_name: str) -> str:

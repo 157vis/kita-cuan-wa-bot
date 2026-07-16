@@ -518,6 +518,15 @@ async def webhook(request: Request):
             await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
             return {"status": "ok", "mode": "cs_unrouted", "wa_logged": False}
 
+        # === Plan tier gate untuk CS Agent ===
+        # Free user boleh pakai CS Agent, tapi kasih soft warning di footer.
+        # Pro/Bisnis/Kemitraan → full experience tanpa warning.
+        tier = "free"
+        try:
+            tier = core.get_plan_tier(csat_tenant)
+        except Exception as exc:
+            logger.warning("get_plan_tier gagal (default free): %s", exc)
+
         csat_reply = await _ask_csat_agent(
             user_id=csat_tenant,
             sender=phone,
@@ -526,6 +535,14 @@ async def webhook(request: Request):
         )
         if csat_reply:
             reply = f"{bot_header()}\n\n{csat_reply}"
+            # Soft upgrade hint untuk free tier
+            if tier == "free":
+                reply += (
+                    "\n\n—\n"
+                    "💡 _Pakai paket Gratis laris.AI. "
+                    "Upgrade ke Pro untuk CS Agent tanpa batas + AI Vision & Voice. "
+                    "Ketik *upgrade* untuk info._"
+                )
         else:
             reply = (
                 f"{bot_header()}\n\n"
@@ -575,8 +592,34 @@ async def webhook(request: Request):
             # reach try ini (sudah di-return). Tapi kalau reach sini, fallback None.
             user_id = None
 
+        # === Plan tier resolution (untuk owner route premium-feature gate) ===
+        _owner_tier = "free"
+        if user_id:
+            try:
+                _owner_tier = core.get_plan_tier(user_id)
+            except Exception as exc:
+                logger.warning("get_plan_tier (owner) gagal: %s", exc)
+
         # === CATAT (text/image/voice) — owner route ===
         if media_type in ("image", "photo") and media_url:
+            # === Plan gate: AI Vision hanya untuk Pro+ ===
+            if not core.is_premium_feature_allowed(user_id, "vision") if user_id else True:
+                # Free user mencoba Vision — kasih soft hint
+                reply = (
+                    f"{bot_header()}\n\n"
+                    f"📸 _Aku terima foto strukmu!_\n\n"
+                    f"Tapi fitur **scan struk otomatis** khusus paket "
+                    f"**Pro** (Rp 149rb/bln) ke atas.\n\n"
+                    f"💡 Sambil itu, kamu bisa ketik transaksinya secara teks, misal:\n"
+                    f"  • _jual indomie 3500_\n"
+                    f"  • _beli bensin 50000_\n\n"
+                    f"Ketik *upgrade* untuk info Pro 💎"
+                )
+                await asyncio.sleep(random_typing_delay())
+                await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
+                _persist_wa_log(phone, text or "", reply, user_id=user_id)
+                return {"status": "ok", "mode": "vision_blocked_free"}
+
             async with httpx.AsyncClient() as client:
                 resp = await client.get(media_url)
                 b64 = base64.b64encode(resp.content).decode("utf-8")
@@ -596,6 +639,23 @@ async def webhook(request: Request):
             reply += _orchestrate(user_id, text or "struk", data)
 
         elif media_type in ("audio", "voice") and media_url:
+            # === Plan gate: AI Voice hanya untuk Pro+ ===
+            if user_id and not core.is_premium_feature_allowed(user_id, "voice"):
+                reply = (
+                    f"{bot_header()}\n\n"
+                    f"🎤 _Aku terima voice note-mu!_\n\n"
+                    f"Tapi fitur **voice note → transaksi otomatis** khusus paket "
+                    f"**Pro** (Rp 149rb/bln) ke atas.\n\n"
+                    f"💡 Sambil itu, kamu bisa ketik transaksinya secara teks, misal:\n"
+                    f"  • _jual indomie 3500_\n"
+                    f"  • _beli bensin 50000_\n\n"
+                    f"Ketik *upgrade* untuk info Pro 💎"
+                )
+                await asyncio.sleep(random_typing_delay())
+                await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
+                _persist_wa_log(phone, text or "", reply, user_id=user_id)
+                return {"status": "ok", "mode": "voice_blocked_free"}
+
             async with httpx.AsyncClient() as client:
                 resp = await client.get(media_url)
             data = voice_extractor_agent(resp.content)
@@ -745,11 +805,39 @@ async def webhook(request: Request):
                         f"Coba lagi nanti ya~"
                     )
 
+            elif intent == "UPGRADE" or (text and text.strip().lower() in ("upgrade", "harga", "pricing", "pro", "paket")):
+                # Tampilkan info paket Pro
+                tier = _owner_tier  # sudah di-resolve di atas
+                tier_label = {"free": "Gratis", "pro": "Pro", "bisnis": "Bisnis"}.get(tier, tier.title())
+                reply = (
+                    f"{bot_header()}\n\n"
+                    f"💎 *Paket laris.AI*\n\n"
+                    f"Paket kamu saat ini: *{tier_label}*\n\n"
+                    f"🌱 *Gratis* — Rp 0/bln\n"
+                    f"  AI Catat (text), Skor Bisnis, command /stok /produk /laporan\n\n"
+                    f"🚀 *Pro* — Rp 149.000/bln ⭐\n"
+                    f"  • Unlimited transaksi & chat customer\n"
+                    f"  • AI Catat (text + foto struk + voice note)\n"
+                    f"  • CS Agent 24/7 untuk customer\n"
+                    f"  • Saran AI + Laporan otomatis\n"
+                    f"  • Alert stok tipis\n\n"
+                    f"🏢 *Bisnis* — Rp 399.000/bln\n"
+                    f"  • Semua fitur Pro\n"
+                    f"  • 3 cabang + 5 staf\n"
+                    f"  • Custom domain + branding\n"
+                    f"  • API access\n\n"
+                    f"Cara upgrade:\n"
+                    f"1. Transfer ke BCA/OVO/GoPay a/n [isi nanti]\n"
+                    f"2. Kirim bukti transfer ke WA ini\n"
+                    f"3. Akun di-upgrade dalam 1×24 jam\n\n"
+                    f"Info lengkap: https://larisai.my.id/pricing.html"
+                )
+
             else:
                 reply = (
                     f"{bot_header()}\n\n"
                     f"Hmm, {BOT_NAME} belum paham maksudmu 🤔\n\n"
-                    f"Coba:\n• _jual kopi 50rb_\n• _stok_ — cek stok produk\n• _produk_ — list semua produk\n• _berapa skor_\n• _saran bisnis_\n• _hapus_"
+                    f"Coba:\n• _jual kopi 50rb_\n• _stok_ — cek stok produk\n• _produk_ — list semua produk\n• _berapa skor_\n• _saran bisnis_\n• _hapus_\n• _upgrade_ — info paket Pro"
                 )
         else:
             reply = f"{bot_header()}\n\nKirim teks, foto struk, atau voice note ya~ 😊"
