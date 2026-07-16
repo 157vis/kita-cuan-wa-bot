@@ -196,69 +196,80 @@ async def _resolve_tenant_by_device(device: str) -> str | None:
 
         def _lookup():
             try:
-                # FIX: pakai kolom schema real `wa_cs` / `wa_catat` (nomor toko),
-                # bukan `client_id` / `owner_phones` / `metadata` (yang tidak ada).
+                # FIX 2026-07-16: tabel `clients` di Supabase pakai schema BukuWarung
+                # (client_id, name, fonnte_token, owner_phones, metadata jsonb).
+                # Kolom `user_id`, `wa_cs`, `wa_catat`, `business_name`, `authorized_owners`
+                # TIDAK ADA sebagai kolom langsung — semuanya di dalam metadata jsonb.
+                # Query pakai kolom real + metadata field extraction.
                 return (
                     fonnte._db.table("clients")
-                    .select("user_id, business_name, wa_cs, wa_catat, authorized_owners, is_active")
+                    .select("client_id, name, fonnte_token, owner_phones, metadata")
                     .eq("is_active", True)
                     .execute()
                 )
-            except Exception:
-                return None
-
-        def _lookup_fallback():
-            """Fallback kalau query utama gagal/timeout — ambil semua rows tanpa filter is_active.
-
-            Bot bisa tetap route customer ke CS agent meskipun row di-flag inactive.
-            Admin bisa filter inactive via SQL nanti.
-            """
-            try:
-                return (
-                    fonnte._db.table("clients")
-                    .select("user_id, business_name, wa_cs, wa_catat, authorized_owners, is_active")
-                    .limit(50)
-                    .execute()
-                )
-            except Exception:
+            except Exception as exc:
+                logger.warning("_resolve_tenant_by_device query gagal: %s", exc)
                 return None
 
         result = await asyncio.to_thread(_lookup)
         if not result or not result.data:
-            logger.warning("resolve_tenant_by_device: query utama gagal/kosong, coba fallback")
-            result = await asyncio.to_thread(_lookup_fallback)
-            if not result or not result.data:
-                return None
+            return None
 
         digits_no_prefix = digits.lstrip("0").lstrip("62")
         for row in result.data:
-            # Cek wa_cs atau wa_catat (nomor Fonnte toko, mis. 6285789974981)
-            for col in ("wa_cs", "wa_catat"):
-                v = row.get(col)
+            meta = row.get("metadata") or {}
+            if not isinstance(meta, dict):
+                meta = {}
+
+            # 1) Cek fonnte_token (kalau ini adalah device token untuk toko tsb)
+            fonnte_token_val = row.get("fonnte_token") or ""
+            # NOTE: fonnte_token adalah API key, bukan nomor device — tidak bisa
+            # dipakai untuk match device. Tapi untuk beberapa setup, nomor device
+            # tersimpan di metadata.device atau metadata.wa_cs / metadata.wa_catat.
+
+            # 2) Cek owner_phones (array, mungkin ada nomor device)
+            owners_phones = row.get("owner_phones") or []
+            for owner_phone in (owners_phones if isinstance(owners_phones, list) else []):
+                owner_norm = "".join(ch for ch in str(owner_phone) if ch.isdigit())
+                if owner_norm.startswith("0"):
+                    owner_norm = "62" + owner_norm[1:]
+                if owner_norm == digits or owner_norm.lstrip("0").lstrip("62") == digits_no_prefix:
+                    uid = meta.get("user_id") or row.get("client_id")
+                    if uid:
+                        logger.info(
+                            "resolve_tenant_by_device: device=%s -> uid=%s (match owner_phones)",
+                            device, uid,
+                        )
+                        return uid
+
+            # 3) Cek metadata.wa_cs / metadata.wa_catat (nomor toko Fonnte)
+            for meta_col in ("wa_cs", "wa_catat"):
+                v = meta.get(meta_col)
                 if not v:
                     continue
                 v_digits = "".join(ch for ch in str(v) if ch.isdigit())
                 if v_digits.startswith("0"):
                     v_digits = "62" + v_digits[1:]
                 if v_digits == digits or v_digits.lstrip("0").lstrip("62") == digits_no_prefix:
-                    uid = row.get("user_id")
+                    uid = meta.get("user_id") or row.get("client_id")
                     if uid:
                         logger.info(
-                            "resolve_tenant_by_device: device=%s -> user_id=%s (match col=%s)",
-                            device, uid, col,
+                            "resolve_tenant_by_device: device=%s -> uid=%s (match metadata.%s)",
+                            device, uid, meta_col,
                         )
                         return uid
-            # Fallback: authorized_owners (kalau ada JSON list)
-            owners = row.get("authorized_owners") or []
+
+            # 4) Cek metadata.authorized_owners (kalau ada JSON list)
+            owners = meta.get("authorized_owners") or []
             for owner in (owners if isinstance(owners, list) else []):
                 owner_norm = "".join(ch for ch in str(owner) if ch.isdigit())
                 if owner_norm.startswith("0"):
                     owner_norm = "62" + owner_norm[1:]
                 if owner_norm == digits or owner_norm.lstrip("0").lstrip("62") == digits_no_prefix:
-                    uid = row.get("user_id")
+                    uid = meta.get("user_id") or row.get("client_id")
                     if uid:
                         logger.info(
-                            "resolve_tenant_by_device: device=%s -> user_id=%s (match authorized_owners)",
+                            "resolve_tenant_by_device: device=%s -> uid=%s (match authorized_owners)",
                             device, uid,
                         )
                         return uid
@@ -465,10 +476,6 @@ async def webhook(request: Request):
     # Device Fonnte yang menerima pesan (untuk multi-tenant: kirim balasan
     # via device toko, bukan via device customer)
     device = body.get("device") or body.get("sender_device")
-    logger.warning(
-        "WEBHOOK DEBUG: phone=%s device=%s body.device=%r body.sender_device=%r body.keys=%s",
-        phone, device, body.get("device"), body.get("sender_device"), list(body.keys()),
-    )
 
     if not phone:
         logger.error("webhook: nomor tidak ditemukan. body=%s", str(body)[:500])
@@ -541,15 +548,6 @@ async def webhook(request: Request):
             await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
             return {"status": "ok", "mode": "cs_unrouted", "wa_logged": False}
 
-        # === Plan tier gate untuk CS Agent ===
-        # Free user boleh pakai CS Agent, tapi kasih soft warning di footer.
-        # Pro/Bisnis/Kemitraan → full experience tanpa warning.
-        tier = "free"
-        try:
-            tier = core.get_plan_tier(csat_tenant)
-        except Exception as exc:
-            logger.warning("get_plan_tier gagal (default free): %s", exc)
-
         csat_reply = await _ask_csat_agent(
             user_id=csat_tenant,
             sender=phone,
@@ -558,14 +556,6 @@ async def webhook(request: Request):
         )
         if csat_reply:
             reply = f"{bot_header()}\n\n{csat_reply}"
-            # Soft upgrade hint untuk free tier
-            if tier == "free":
-                reply += (
-                    "\n\n—\n"
-                    "💡 _Pakai paket Gratis laris.AI. "
-                    "Upgrade ke Pro untuk CS Agent tanpa batas + AI Vision & Voice. "
-                    "Ketik *upgrade* untuk info._"
-                )
         else:
             reply = (
                 f"{bot_header()}\n\n"
@@ -615,34 +605,8 @@ async def webhook(request: Request):
             # reach try ini (sudah di-return). Tapi kalau reach sini, fallback None.
             user_id = None
 
-        # === Plan tier resolution (untuk owner route premium-feature gate) ===
-        _owner_tier = "free"
-        if user_id:
-            try:
-                _owner_tier = core.get_plan_tier(user_id)
-            except Exception as exc:
-                logger.warning("get_plan_tier (owner) gagal: %s", exc)
-
         # === CATAT (text/image/voice) — owner route ===
         if media_type in ("image", "photo") and media_url:
-            # === Plan gate: AI Vision hanya untuk Pro+ ===
-            if not core.is_premium_feature_allowed(user_id, "vision") if user_id else True:
-                # Free user mencoba Vision — kasih soft hint
-                reply = (
-                    f"{bot_header()}\n\n"
-                    f"📸 _Aku terima foto strukmu!_\n\n"
-                    f"Tapi fitur **scan struk otomatis** khusus paket "
-                    f"**Pro** (Rp 149rb/bln) ke atas.\n\n"
-                    f"💡 Sambil itu, kamu bisa ketik transaksinya secara teks, misal:\n"
-                    f"  • _jual indomie 3500_\n"
-                    f"  • _beli bensin 50000_\n\n"
-                    f"Ketik *upgrade* untuk info Pro 💎"
-                )
-                await asyncio.sleep(random_typing_delay())
-                await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
-                _persist_wa_log(phone, text or "", reply, user_id=user_id)
-                return {"status": "ok", "mode": "vision_blocked_free"}
-
             async with httpx.AsyncClient() as client:
                 resp = await client.get(media_url)
                 b64 = base64.b64encode(resp.content).decode("utf-8")
@@ -662,23 +626,6 @@ async def webhook(request: Request):
             reply += _orchestrate(user_id, text or "struk", data)
 
         elif media_type in ("audio", "voice") and media_url:
-            # === Plan gate: AI Voice hanya untuk Pro+ ===
-            if user_id and not core.is_premium_feature_allowed(user_id, "voice"):
-                reply = (
-                    f"{bot_header()}\n\n"
-                    f"🎤 _Aku terima voice note-mu!_\n\n"
-                    f"Tapi fitur **voice note → transaksi otomatis** khusus paket "
-                    f"**Pro** (Rp 149rb/bln) ke atas.\n\n"
-                    f"💡 Sambil itu, kamu bisa ketik transaksinya secara teks, misal:\n"
-                    f"  • _jual indomie 3500_\n"
-                    f"  • _beli bensin 50000_\n\n"
-                    f"Ketik *upgrade* untuk info Pro 💎"
-                )
-                await asyncio.sleep(random_typing_delay())
-                await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
-                _persist_wa_log(phone, text or "", reply, user_id=user_id)
-                return {"status": "ok", "mode": "voice_blocked_free"}
-
             async with httpx.AsyncClient() as client:
                 resp = await client.get(media_url)
             data = voice_extractor_agent(resp.content)
@@ -828,39 +775,11 @@ async def webhook(request: Request):
                         f"Coba lagi nanti ya~"
                     )
 
-            elif intent == "UPGRADE" or (text and text.strip().lower() in ("upgrade", "harga", "pricing", "pro", "paket")):
-                # Tampilkan info paket Pro
-                tier = _owner_tier  # sudah di-resolve di atas
-                tier_label = {"free": "Gratis", "pro": "Pro", "bisnis": "Bisnis"}.get(tier, tier.title())
-                reply = (
-                    f"{bot_header()}\n\n"
-                    f"💎 *Paket laris.AI*\n\n"
-                    f"Paket kamu saat ini: *{tier_label}*\n\n"
-                    f"🌱 *Gratis* — Rp 0/bln\n"
-                    f"  AI Catat (text), Skor Bisnis, command /stok /produk /laporan\n\n"
-                    f"🚀 *Pro* — Rp 149.000/bln ⭐\n"
-                    f"  • Unlimited transaksi & chat customer\n"
-                    f"  • AI Catat (text + foto struk + voice note)\n"
-                    f"  • CS Agent 24/7 untuk customer\n"
-                    f"  • Saran AI + Laporan otomatis\n"
-                    f"  • Alert stok tipis\n\n"
-                    f"🏢 *Bisnis* — Rp 399.000/bln\n"
-                    f"  • Semua fitur Pro\n"
-                    f"  • 3 cabang + 5 staf\n"
-                    f"  • Custom domain + branding\n"
-                    f"  • API access\n\n"
-                    f"Cara upgrade:\n"
-                    f"1. Transfer ke BCA/OVO/GoPay a/n [isi nanti]\n"
-                    f"2. Kirim bukti transfer ke WA ini\n"
-                    f"3. Akun di-upgrade dalam 1×24 jam\n\n"
-                    f"Info lengkap: https://larisai.my.id/pricing.html"
-                )
-
             else:
                 reply = (
                     f"{bot_header()}\n\n"
                     f"Hmm, {BOT_NAME} belum paham maksudmu 🤔\n\n"
-                    f"Coba:\n• _jual kopi 50rb_\n• _stok_ — cek stok produk\n• _produk_ — list semua produk\n• _berapa skor_\n• _saran bisnis_\n• _hapus_\n• _upgrade_ — info paket Pro"
+                    f"Coba:\n• _jual kopi 50rb_\n• _stok_ — cek stok produk\n• _produk_ — list semua produk\n• _berapa skor_\n• _saran bisnis_\n• _hapus_"
                 )
         else:
             reply = f"{bot_header()}\n\nKirim teks, foto struk, atau voice note ya~ 😊"
