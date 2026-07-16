@@ -217,26 +217,30 @@ class LarisCore:
         return self.supabase.table("client_settings").upsert(payload, on_conflict="user_id").execute()
 
     # ============================================================
-    # Plan / Tier — enable/disable fitur berdasarkan subscription
+    # Plan / Tier — Free / Pro / Bisnis / Kemitraan
+    # Pakai client_id (PK asli) bukan user_id (tidak ada di real schema)
     # ============================================================
     PLAN_TIERS = ("free", "pro", "bisnis", "kemitraan")
+    PLAN_LIMITS = {
+        "free":      {"tx": 100,  "customer_chat": 50,   "warehouses": 1},
+        "pro":       {"tx": 1000, "customer_chat": 500,  "warehouses": 5},
+        "bisnis":    {"tx": 10000,"customer_chat": 5000, "warehouses": 20},
+        "kemitraan": {"tx": 999999, "customer_chat": 999999, "warehouses": 999},
+    }
 
-    def get_plan_tier(self, user_id: str) -> str:
-        """Ambil plan_tier user dari tabel clients.
+    def get_plan_tier(self, client_id: str) -> str:
+        """Ambil plan_tier dari tabel clients by client_id.
 
         Returns salah satu dari: 'free', 'pro', 'bisnis', 'kemitraan'.
-        Default 'free' kalau row tidak ada atau plan_expires_at sudah lewat.
-
-        Opsi C (sesuai strategi user): tidak ada counter. Hanya deteksi tier.
+        Default 'free' kalau row tidak ada / plan_expires_at sudah lewat.
         """
-        uid = self.normalize_user_id(user_id)
-        if not uid:
+        if not client_id:
             return "free"
         try:
             resp = (
                 self.supabase.table("clients")
                 .select("plan_tier, plan_expires_at, is_active")
-                .eq("user_id", uid)
+                .eq("client_id", client_id)
                 .limit(1)
                 .execute()
             )
@@ -248,7 +252,7 @@ class LarisCore:
                 tier = "free"
             # Auto-downgrade ke free kalau plan_expires_at < NOW()
             expires_at = rows[0].get("plan_expires_at")
-            if expires_at and tier != "free":
+            if expires_at and tier != "free" and tier != "kemitraan":
                 try:
                     exp_str = expires_at.replace("Z", "+00:00")
                     exp_dt = datetime.fromisoformat(exp_str)
@@ -257,52 +261,102 @@ class LarisCore:
                         exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
                     if exp_dt < now:
                         logger.info(
-                            "get_plan_tier: plan %s sudah expire untuk user=%s, auto-free",
-                            tier, uid,
+                            "get_plan_tier: plan %s sudah expire untuk client_id=%s, auto-free",
+                            tier, client_id,
                         )
                         tier = "free"
                 except Exception as exc:
                     logger.debug("get_plan_tier: parse expires_at gagal: %s", exc)
-            # Kalau client non-aktif, treat sebagai free
+            # Kalau client non-aktif, treat sebagai free (kecuali kemitraan)
             if rows[0].get("is_active") is False and tier != "kemitraan":
                 tier = "free"
             return tier
         except Exception as exc:
-            logger.error("get_plan_tier user=%s: %s", uid, exc)
+            logger.error("get_plan_tier client_id=%s: %s", client_id, exc)
             return "free"
 
-    def is_premium_feature_allowed(self, user_id: str, feature: str) -> bool:
-        """Cek apakah user boleh pakai fitur premium.
-
-        Args:
-            user_id: UUID tenant
-            feature: salah satu dari:
-                - 'cs_agent'        -> CS Agent 24/7 untuk customer
-                - 'vision'          -> AI Vision (scan struk foto)
-                - 'voice'           -> AI Voice note
-                - 'custom_branding' -> Logo + warna di laporan
-                - 'multi_branch'    -> Multi-toko (3 cabang)
-                - 'api_access'      -> API untuk integrasi
-
-        Returns True kalau tier user boleh pakai fitur tsb.
-        """
-        tier = self.get_plan_tier(user_id)
-        allowed_by_tier = {
-            "free":       {"cs_agent": False, "vision": False, "voice": False,
-                           "custom_branding": False, "multi_branch": False,
-                           "api_access": False},
-            "pro":        {"cs_agent": True,  "vision": True,  "voice": True,
-                           "custom_branding": False, "multi_branch": False,
-                           "api_access": False},
-            "bisnis":     {"cs_agent": True,  "vision": True,  "voice": True,
-                           "custom_branding": True,  "multi_branch": True,
-                           "api_access": True},
-            "kemitraan":  {"cs_agent": True,  "vision": True,  "voice": True,
-                           "custom_branding": True,  "multi_branch": True,
-                           "api_access": True},
+    def get_plan_limits(self, client_id: str) -> dict:
+        """Ambil limit tier user (untuk UI display & rate-limit check)."""
+        tier = self.get_plan_tier(client_id)
+        return {
+            "tier": tier,
+            **self.PLAN_LIMITS.get(tier, self.PLAN_LIMITS["free"]),
         }
-        rules = allowed_by_tier.get(tier, allowed_by_tier["free"])
-        return bool(rules.get(feature, False))
+
+    def upgrade_plan(
+        self,
+        client_id: str,
+        new_tier: str,
+        duration_days: int = 30,
+    ) -> tuple[bool, str]:
+        """Upgrade client ke tier baru (dipanggil manual admin setelah bukti transfer)."""
+        if new_tier not in self.PLAN_TIERS:
+            return False, f"tier tidak valid: {new_tier}"
+        if not client_id:
+            return False, "client_id kosong"
+        try:
+            payload = {
+                "plan_tier": new_tier,
+                "plan_started_at": datetime.now(datetime.timezone.utc).isoformat(),
+                "plan_expires_at": (
+                    datetime.now(datetime.timezone.utc) + timedelta(days=duration_days)
+                ).isoformat(),
+            }
+            self.supabase.table("clients").update(payload).eq("client_id", client_id).execute()
+            logger.info("upgrade_plan: client_id=%s -> %s (%d hari)", client_id, new_tier, duration_days)
+            return True, f"Berhasil upgrade ke {new_tier} selama {duration_days} hari"
+        except Exception as exc:
+            logger.error("upgrade_plan client_id=%s: %s", client_id, exc)
+            return False, str(exc)[:200]
+
+    def check_tx_quota(self, client_id: str) -> dict:
+        """Cek apakah client boleh catat transaksi bulan ini."""
+        try:
+            resp = (
+                self.supabase.table("clients")
+                .select("plan_tier, tx_count_this_month")
+                .eq("client_id", client_id)
+                .limit(1)
+                .execute()
+            )
+            rows = resp.data or []
+            tier = rows[0].get("plan_tier", "free") if rows else "free"
+            count = rows[0].get("tx_count_this_month", 0) if rows else 0
+        except Exception:
+            tier, count = "free", 0
+        limit = self.PLAN_LIMITS.get(tier, self.PLAN_LIMITS["free"])["tx"]
+        return {
+            "tier": tier,
+            "current": count,
+            "limit": limit,
+            "allowed": count < limit,
+            "remaining": max(0, limit - count),
+        }
+
+    def increment_tx_count(self, client_id: str) -> None:
+        """Increment counter transaksi (called setelah catat sukses)."""
+        if not client_id:
+            return
+        try:
+            # Pakai raw query via PostgREST RPC kalau ada, fallback ke Python
+            self.supabase.rpc("increment_tx_count", {"p_client_id": client_id}).execute()
+        except Exception:
+            # Fallback: select + update
+            try:
+                resp = (
+                    self.supabase.table("clients")
+                    .select("tx_count_this_month")
+                    .eq("client_id", client_id)
+                    .limit(1)
+                    .execute()
+                )
+                rows = resp.data or []
+                current = (rows[0].get("tx_count_this_month", 0) if rows else 0) + 1
+                self.supabase.table("clients").update(
+                    {"tx_count_this_month": current}
+                ).eq("client_id", client_id).execute()
+            except Exception as exc:
+                logger.debug("increment_tx_count fallback gagal: %s", exc)
 
     @staticmethod
     def slugify_client_id(label: str, email: str = "") -> str:
