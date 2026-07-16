@@ -196,9 +196,11 @@ async def _resolve_tenant_by_device(device: str) -> str | None:
 
         def _lookup():
             try:
+                # FIX: pakai kolom schema real `wa_cs` / `wa_catat` (nomor toko),
+                # bukan `client_id` / `owner_phones` / `metadata` (yang tidak ada).
                 return (
                     fonnte._db.table("clients")
-                    .select("client_id, owner_phones, metadata")
+                    .select("user_id, business_name, wa_cs, wa_catat, authorized_owners")
                     .eq("is_active", True)
                     .execute()
                 )
@@ -208,30 +210,46 @@ async def _resolve_tenant_by_device(device: str) -> str | None:
         result = await asyncio.to_thread(_lookup)
         if not result or not result.data:
             return None
+
+        digits_no_prefix = digits.lstrip("0").lstrip("62")
         for row in result.data:
-            # Cek metadata.device
-            meta = row.get("metadata") or {}
-            if isinstance(meta, dict):
-                meta_dev = meta.get("device") or meta.get("fonnte_device")
-                if meta_dev and "".join(ch for ch in str(meta_dev) if ch.isdigit()).lstrip("0").lstrip("62").startswith(digits.lstrip("62")):
-                    # Prefer metadata.user_id (UUID) untuk CS agent URL
-                    if meta.get("user_id"):
-                        return meta.get("user_id")
-                    return row.get("client_id")
-            # Fallback: owner_phones[0] cocok dengan device
-            owners = row.get("owner_phones") or []
-            for owner in owners:
+            # Cek wa_cs atau wa_catat (nomor Fonnte toko, mis. 6285789974981)
+            for col in ("wa_cs", "wa_catat"):
+                v = row.get(col)
+                if not v:
+                    continue
+                v_digits = "".join(ch for ch in str(v) if ch.isdigit())
+                if v_digits.startswith("0"):
+                    v_digits = "62" + v_digits[1:]
+                if v_digits == digits or v_digits.lstrip("0").lstrip("62") == digits_no_prefix:
+                    uid = row.get("user_id")
+                    if uid:
+                        logger.info(
+                            "resolve_tenant_by_device: device=%s -> user_id=%s (match col=%s)",
+                            device, uid, col,
+                        )
+                        return uid
+            # Fallback: authorized_owners (kalau ada JSON list)
+            owners = row.get("authorized_owners") or []
+            for owner in (owners if isinstance(owners, list) else []):
                 owner_norm = "".join(ch for ch in str(owner) if ch.isdigit())
                 if owner_norm.startswith("0"):
                     owner_norm = "62" + owner_norm[1:]
-                if owner_norm == digits:
-                    # Prefer metadata.user_id (UUID) untuk CS agent URL
-                    if isinstance(meta, dict) and meta.get("user_id"):
-                        return meta.get("user_id")
-                    return row.get("client_id")
+                if owner_norm == digits or owner_norm.lstrip("0").lstrip("62") == digits_no_prefix:
+                    uid = row.get("user_id")
+                    if uid:
+                        logger.info(
+                            "resolve_tenant_by_device: device=%s -> user_id=%s (match authorized_owners)",
+                            device, uid,
+                        )
+                        return uid
     except Exception as exc:
         logger.warning("resolve_tenant_by_device gagal: %s", exc)
 
+    logger.warning(
+        "resolve_tenant_by_device: device=%s tidak ditemukan di tabel clients",
+        device,
+    )
     return None
 
 
@@ -441,7 +459,94 @@ async def webhook(request: Request):
         logger.debug("ignored duplicate: %s", phone)
         return {"status": "ignored", "reason": "duplicate"}
 
-    if text.lower() in ("test", "ping", "tes", "halo", "hi"):
+    # === Resolve user_id SEBELUM halo/ping check ===
+    # FIX: Cek dulu apakah pengirim adalah owner atau customer.
+    # Kalau customer (nomor tidak ada di wa_users), langsung forward ke CS Agent.
+    # Kalau owner, baru boleh lewat halo/ping check yang balas dengan greeting Laris.
+    # Tanpa fix ini, customer yang kirim "Halo" akan dapat jawaban owner-route
+    # ("Aku Laris, asisten pembukuan tokomu") bukan jawaban CS Agent.
+    _user_id_for_route = None
+    try:
+        _user_id_for_route = resolve_user_id(phone)
+        logger.warning(
+            "ROUTE DEBUG: phone=%s -> resolve_user_id=%s (treated as OWNER, user_id=%s)",
+            phone, _user_id_for_route, _user_id_for_route,
+        )
+    except ValueError as exc:
+        _user_id_for_route = None  # customer
+        logger.warning(
+            "ROUTE DEBUG: phone=%s -> ValueError (treated as CUSTOMER). Reason: %s",
+            phone, str(exc)[:120],
+        )
+    except Exception as exc:
+        _user_id_for_route = None
+        logger.warning(
+            "ROUTE DEBUG: phone=%s -> %s: %s (treated as CUSTOMER, fallback)",
+            phone, type(exc).__name__, str(exc)[:120],
+        )
+
+    # === CUSTOMER (bukan owner) → forward ke CS AI Multi-Agent ===
+    if _user_id_for_route is None and text:
+        logger.warning(
+            "ROUTE DEBUG: CUSTOMER ROUTE AKTIF. phone=%s, device=%s, text=%r",
+            phone, device, text[:80],
+        )
+        csat_tenant = None
+        if device:
+            try:
+                _ = get_fonnte()
+                csat_tenant = await _resolve_tenant_by_device(device)
+                logger.warning("ROUTE DEBUG: _resolve_tenant_by_device(%s) -> %s", device, csat_tenant)
+            except Exception as exc:
+                logger.warning("resolve_tenant_by_device gagal: %s", exc)
+        else:
+            logger.warning("ROUTE DEBUG: device kosong — tidak bisa lookup tenant. body.keys=%s", list(body.keys()))
+
+        if not csat_tenant:
+            logger.error(
+                "customer %s chat tapi tenant tidak ter-resolve dari device=%s. "
+                "Bot tidak bisa forward ke CS agent.",
+                phone, device,
+            )
+            reply = (
+                f"{bot_header()}\n\n"
+                f"Halo! 👋\n\n"
+                f"Mohon maaf, sistem kami sedang sibuk. "
+                f"Admin akan segera menghubungi Anda kembali 🙏"
+            )
+            await asyncio.sleep(random_typing_delay())
+            await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
+            return {"status": "ok", "mode": "cs_unrouted", "wa_logged": False}
+
+        csat_reply = await _ask_csat_agent(
+            user_id=csat_tenant,
+            sender=phone,
+            text=text,
+            name=body.get("name", ""),
+        )
+        if csat_reply:
+            reply = f"{bot_header()}\n\n{csat_reply}"
+        else:
+            reply = (
+                f"{bot_header()}\n\n"
+                f"Halo! 👋 Selamat datang di toko kami.\n"
+                f"Silakan tanya produk, harga, atau stok ya~\n"
+                f"Admin kami akan segera membantu 😊"
+            )
+        await asyncio.sleep(random_typing_delay())
+        await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
+        # Persist customer chat ke wa_messages pakai tenant UUID (bukan customer phone)
+        logged = _persist_wa_log(phone, text, reply, user_id=csat_tenant)
+        return {"status": "ok", "mode": "cs_customer", "wa_logged": logged}
+
+    # === OWNER ROUTE — halo/ping check ===
+    # Hanya sampai sini kalau pengirim adalah owner (atau nomor tidak dikenal +
+    # device kosong + tidak ada text — kasus langka yang tidak akan masuk CS).
+    logger.warning(
+        "ROUTE DEBUG: masuk OWNER ROUTE block. _user_id_for_route=%s, text=%r, text.lower=%r",
+        _user_id_for_route, text, (text or "").lower(),
+    )
+    if text and text.lower() in ("test", "ping", "tes", "halo", "hi"):
         greeting = get_greeting()
         reply = (
             f"{greeting}! 👋\n\n"
@@ -461,45 +566,16 @@ async def webhook(request: Request):
     user_id = None
 
     try:
+        # === Resolve user_id sekali di awal (untuk owner route di bawah) ===
         try:
             user_id = resolve_user_id(phone)
         except ValueError:
-            # Nomor tidak ada di wa_users → customer (bukan owner)
+            # Customer route sudah di-handle SEBELUM outer try (top-level).
+            # Kalau sampai sini, _user_id_for_route juga None → caller tidak akan
+            # reach try ini (sudah di-return). Tapi kalau reach sini, fallback None.
             user_id = None
 
-        # === CUSTOMER (bukan owner) → forward ke CS AI Multi-Agent ===
-        if not user_id and text:
-            logger.info("customer message from %s (device=%s) — forwarding to CSAT", phone, device)
-            # Resolve client_id dari device Fonnte (nomor toko yang menerima pesan)
-            csat_tenant = None
-            if device:
-                try:
-                    client_obj = get_fonnte()
-                    # Lookup client yang punya device di metadata atau owner_phones
-                    csat_tenant = await _resolve_tenant_by_device(device)
-                except Exception as exc:
-                    logger.warning("resolve_tenant_by_device gagal: %s", exc)
-            if not csat_tenant:
-                csat_tenant = "toko_rafih"  # fallback default tenant
-            csat_reply = await _ask_csat_agent(
-                user_id=csat_tenant,
-                sender=phone,
-                text=text,
-                name=body.get("name", ""),
-            )
-            if csat_reply:
-                reply = f"{bot_header()}\n\n{csat_reply}"
-            else:
-                reply = (
-                    f"{bot_header()}\n\n"
-                    f"Halo! 👋 Selamat datang di toko kami.\n"
-                    f"Silakan tanya produk, harga, atau stok ya~\n"
-                    f"Admin kami akan segera membantu 😊"
-                )
-            await asyncio.sleep(random_typing_delay())
-            await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
-            return {"status": "ok", "mode": "cs_customer", "wa_logged": True}
-
+        # === CATAT (text/image/voice) — owner route ===
         if media_type in ("image", "photo") and media_url:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(media_url)
