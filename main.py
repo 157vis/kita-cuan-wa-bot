@@ -200,8 +200,24 @@ async def _resolve_tenant_by_device(device: str) -> str | None:
                 # bukan `client_id` / `owner_phones` / `metadata` (yang tidak ada).
                 return (
                     fonnte._db.table("clients")
-                    .select("user_id, business_name, wa_cs, wa_catat, authorized_owners")
+                    .select("user_id, business_name, wa_cs, wa_catat, authorized_owners, is_active")
                     .eq("is_active", True)
+                    .execute()
+                )
+            except Exception:
+                return None
+
+        def _lookup_fallback():
+            """Fallback kalau query utama gagal/timeout — ambil semua rows tanpa filter is_active.
+
+            Bot bisa tetap route customer ke CS agent meskipun row di-flag inactive.
+            Admin bisa filter inactive via SQL nanti.
+            """
+            try:
+                return (
+                    fonnte._db.table("clients")
+                    .select("user_id, business_name, wa_cs, wa_catat, authorized_owners, is_active")
+                    .limit(50)
                     .execute()
                 )
             except Exception:
@@ -209,7 +225,10 @@ async def _resolve_tenant_by_device(device: str) -> str | None:
 
         result = await asyncio.to_thread(_lookup)
         if not result or not result.data:
-            return None
+            logger.warning("resolve_tenant_by_device: query utama gagal/kosong, coba fallback")
+            result = await asyncio.to_thread(_lookup_fallback)
+            if not result or not result.data:
+                return None
 
         digits_no_prefix = digits.lstrip("0").lstrip("62")
         for row in result.data:
