@@ -218,14 +218,16 @@ class LarisCore:
 
     # ============================================================
     # Plan / Tier — Free / Pro / Bisnis / Kemitraan
+    # Strategi 2026-07-16: Free = catat saja (AI Catat), Pro+ = unlock CS Agent
     # Pakai client_id (PK asli) bukan user_id (tidak ada di real schema)
     # ============================================================
     PLAN_TIERS = ("free", "pro", "bisnis", "kemitraan")
+    # customer_chat = -1 artinya CS Agent DINONAKTIFKAN untuk tier ini
     PLAN_LIMITS = {
-        "free":      {"tx": 100,  "customer_chat": 50,   "warehouses": 1},
-        "pro":       {"tx": 1000, "customer_chat": 500,  "warehouses": 5},
-        "bisnis":    {"tx": 10000,"customer_chat": 5000, "warehouses": 20},
-        "kemitraan": {"tx": 999999, "customer_chat": 999999, "warehouses": 999},
+        "free":      {"tx": 100,  "customer_chat": -1,   "warehouses": 1,   "cs_agent": False},
+        "pro":       {"tx": 1000, "customer_chat": 500,  "warehouses": 5,   "cs_agent": True},
+        "bisnis":    {"tx": 10000,"customer_chat": 5000, "warehouses": 20,  "cs_agent": True},
+        "kemitraan": {"tx": 999999, "customer_chat": 999999, "warehouses": 999, "cs_agent": True},
     }
 
     def get_plan_tier(self, client_id: str) -> str:
@@ -275,59 +277,6 @@ class LarisCore:
             logger.error("get_plan_tier client_id=%s: %s", client_id, exc)
             return "free"
 
-    def get_client_id_for_user(self, user_id: str) -> str | None:
-        """Map Supabase auth user_id (UUID) -> clients.client_id (slug mis. 'toko_rafih').
-
-        Penting: `clients.client_id` adalah slug tekstual, bukan UUID auth.users.
-        Dua lookup bertingkat (fallback aman bila salah satu tidak ada):
-
-        1. `clients.metadata->>user_id == user_id` (paling umum, diisi saat
-           onboarding via `upsert_bukuwarung_client`).
-        2. `clients.client_id == user_id` (kasus langka: slug sama dengan UUID).
-
-        Return client_id (string) atau None kalau tidak ketemu.
-        Caller harus fallback ke `user_id` mentah supaya get_plan_tier() tetap
-        aman (mengembalikan 'free' alih-alih error).
-        """
-        uid = self.normalize_user_id(user_id)
-        if not uid:
-            return None
-        if not self.table_exists("clients"):
-            return None
-        try:
-            resp = (
-                self.supabase.table("clients")
-                .select("client_id, owner_phones, metadata")
-                .eq("metadata->>user_id", uid)
-                .limit(1)
-                .execute()
-            )
-            rows = resp.data or []
-            if rows:
-                cid = str(rows[0].get("client_id") or "").strip()
-                if cid:
-                    return cid
-        except Exception as exc:
-            logger.debug("get_client_id_for_user metadata lookup gagal: %s", exc)
-
-        try:
-            resp = (
-                self.supabase.table("clients")
-                .select("client_id")
-                .eq("client_id", uid)
-                .limit(1)
-                .execute()
-            )
-            rows = resp.data or []
-            if rows:
-                cid = str(rows[0].get("client_id") or "").strip()
-                if cid:
-                    return cid
-        except Exception as exc:
-            logger.debug("get_client_id_for_user direct lookup gagal: %s", exc)
-
-        return None
-
     def get_plan_limits(self, client_id: str) -> dict:
         """Ambil limit tier user (untuk UI display & rate-limit check)."""
         tier = self.get_plan_tier(client_id)
@@ -335,6 +284,18 @@ class LarisCore:
             "tier": tier,
             **self.PLAN_LIMITS.get(tier, self.PLAN_LIMITS["free"]),
         }
+
+    def has_cs_agent(self, client_id: str) -> bool:
+        """Apakah tenant ini punya akses ke CS Agent (AI handle customer chat masuk)?
+
+        Free: False (CS Agent nonaktif, hanya AI Catat)
+        Pro/Bisnis/Kemitraan: True (CS Agent aktif)
+        """
+        try:
+            limits = self.get_plan_limits(client_id)
+            return bool(limits.get("cs_agent", False))
+        except Exception:
+            return False
 
     def upgrade_plan(
         self,

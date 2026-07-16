@@ -300,9 +300,35 @@ async def _ask_csat_agent(user_id: str, sender: str, text: str, name: str) -> st
     Otak / memory:
         Sebelum panggil CS webhook, cek otak_memories (tabel di Supabase).
         Kalau ada jawaban tersimpan, langsung pakai — hemat LLM call.
+
+    Plan Gate 2026-07-16:
+        Free tier TIDAK punya akses CS Agent. Kalau customer chat ke toko
+        yang masih free, bot tidak forward ke CS Agent — langsung kasih
+        pesan告知 bahwa CS Agent belum aktif +提示 untuk upgrade.
+        Strategi marketing: Free = catat saja (AI Catat), Pro = unlock CS.
     """
     if not text or not text.strip():
         return None
+
+    # === Plan Gate: cek apakah tenant ini punya CS Agent ===
+    try:
+        _core_gate = get_core()
+        if not _core_gate.has_cs_agent(user_id):
+            tier = _core_gate.get_plan_tier(user_id)
+            logger.info(
+                "PLAN GATE: CS Agent disabled for tenant=%s tier=%s. Skipping CS forward.",
+                user_id, tier,
+            )
+            return (
+                "🙏 Terima kasih sudah menghubungi kami!\n\n"
+                "Toko ini saat ini menggunakan paket Free — "
+                "pelayanan customer service via AI CS 24/7 belum aktif.\n\n"
+                "Untuk info produk, harga, atau pemesanan, "
+                "silakan hubungi langsung nomor owner di bio toko kami. "
+                "Atau upgrade ke Pro untuk menikmati AI CS yang siap melayani 24/7."
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("plan gate check skip: %s", exc)
 
     # === Otak: cek memory dulu (incremental learning) ===
     try:
