@@ -286,15 +286,20 @@ async def _resolve_tenant_by_device(device: str) -> str | None:
 async def _ask_csat_agent(user_id: str, sender: str, text: str, name: str) -> str | None:
     """Forward customer message ke AI Multi-Agent (CS / Sales agent).
 
-    Returns the agent's reply text, atau None kalau gagal.
-    user_id di sini = `metadata.user_id` (UUID) dari tabel `clients`,
-    BUKAN `client_id` string. CS agent route expects UUID.
+    Returns:
+        - String reply kalau CS Agent return reply (jarang — biasanya dia kirim WA sendiri)
+        - "__cs_handled__" kalau CS Agent sudah handle sendiri (status=ok)
+        - None kalau gagal total
+
+    Behavior:
+        CS Agent (`bukuwarung-ai-larisai.up.railway.app/webhook/csat/{UUID}`)
+        mengirim balasan ke customer LANGSUNG via Fonnte — tidak return
+        text reply. Caller (webhook handler) HANYA kirim fallback kalau
+        CS Agent return error/gagal.
 
     Otak / memory:
         Sebelum panggil CS webhook, cek otak_memories (tabel di Supabase).
-        Kalau ada jawaban tersimpan untuk pertanyaan ini (normalized match),
-        langsung pakai — hemat LLM call. Setelah dapat jawaban dari agent,
-        simpan ke memory untuk pertanyaan serupa di masa depan.
+        Kalau ada jawaban tersimpan, langsung pakai — hemat LLM call.
     """
     if not text or not text.strip():
         return None
@@ -326,58 +331,81 @@ async def _ask_csat_agent(user_id: str, sender: str, text: str, name: str) -> st
             logger.warning("csat webhook HTTP %s: %s", resp.status_code, resp.text[:200])
             return None
         data = resp.json()
-        # Beberapa versi return {reply: "..."} atau {intent: ...}
+        logger.warning(
+            "CS DEBUG: user=%s sender=%s -> status=%s agent=%s intent=%s",
+            user_id, sender, data.get("status"), data.get("agent"), data.get("intent"),
+        )
+
+        # === Cek apakah CS Agent return reply eksplisit ===
         reply = (
             data.get("reply")
             or data.get("response")
             or data.get("message")
             or data.get("text")
         )
-        if not reply:
-            # Kalau agent hanya detect intent, generate fallback berdasarkan intent
-            intent = (data.get("intent") or "").lower()
-            agent = (data.get("agent") or "").lower()
-            if intent == "greeting":
-                reply = (
-                    "Halo! Selamat datang di Toko Rafih 👋\n"
-                    "Ada yang bisa saya bantu? Silakan tanya produk, "
-                    "harga, atau stok ya~"
-                )
-            elif intent in ("sales", "product_inquiry"):
-                reply = (
-                    "Tertarik dengan produk kami? Boleh tau barang yang "
-                    "Anda cari? Saya bantu cek stok dan harganya ya 😊"
-                )
-            elif intent == "order":
-                # Customer mau order — minta detail
-                reply = (
-                    "Siap! Boleh info detail ordernya ya:\n"
-                    "• Nama barang\n"
-                    "• Jumlah\n"
-                    "• Alamat kirim (kalau perlu)\n\n"
-                    "Nanti saya proses secepatnya 🙏"
-                )
-            elif intent == "cs" or agent in ("cs", "support"):
-                reply = (
-                    "Terima kasih sudah menghubungi kami 🙏\n"
-                    "Boleh ceritakan keluhan atau pertanyaanmu?\n"
-                    "Admin kami akan segera membantu 😊"
-                )
-            elif agent:
-                reply = (
-                    f"Terima kasih sudah menghubungi kami 🙏\n"
-                    f"Silakan tunggu, admin kami akan segera membantu."
-                )
-
-        # === Otak: simpan jawaban ke memory untuk dipelajari agent ===
-        if reply and reply.strip():
+        if reply:
+            # === Otak: simpan jawaban ke memory ===
             try:
                 _core2 = get_core()
                 await asyncio.to_thread(_core2.remember_answer, user_id, "cs", text, reply)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("otak remember_answer skip: %s", exc)
+            return reply
 
-        return reply
+        # === CS Agent tidak return reply → dia kirim WA sendiri ===
+        # Return sentinel agar caller TIDAK kirim fallback (anti double-send).
+        if data.get("status") == "ok":
+            logger.info(
+                "CS Agent handled sendiri (status=ok). Bot skip kirim fallback. "
+                "user=%s sender=%s intent=%s",
+                user_id, sender, data.get("intent"),
+            )
+            # Simpan intent ke memory untuk learning (kalau customer chat hal
+            # serupa di masa depan)
+            try:
+                _core3 = get_core()
+                intent_note = f"[handled-by-cs-agent:{data.get('agent','?')}:{data.get('intent','?')}]"
+                await asyncio.to_thread(
+                    _core3.remember_answer, user_id, "cs", text, intent_note,
+                )
+            except Exception:
+                pass
+            return "__cs_handled__"
+
+        # === CS Agent return status non-ok → return fallback ===
+        intent = (data.get("intent") or "").lower()
+        agent = (data.get("agent") or "").lower()
+        if intent == "greeting":
+            return (
+                "Halo! Selamat datang di Toko Rafih 👋\n"
+                "Ada yang bisa saya bantu? Silakan tanya produk, "
+                "harga, atau stok ya~"
+            )
+        elif intent in ("sales", "product_inquiry"):
+            return (
+                "Tertarik dengan produk kami? Boleh tau barang yang "
+                "Anda cari? Saya bantu cek stok dan harganya ya 😊"
+            )
+        elif intent == "order":
+            return (
+                "Siap! Boleh info detail ordernya ya:\n"
+                "• Nama barang\n"
+                "• Jumlah\n"
+                "• Alamat kirim (kalau perlu)\n\n"
+                "Nanti saya proses secepatnya 🙏"
+            )
+        elif intent == "cs" or agent in ("cs", "support"):
+            return (
+                "Terima kasih sudah menghubungi kami 🙏\n"
+                "Boleh ceritakan keluhan atau pertanyaanmu?\n"
+                "Admin kami akan segera membantu 😊"
+            )
+        elif agent:
+            return (
+                "Terima kasih sudah menghubungi kami 🙏\n"
+                "Silakan tunggu, admin kami akan segera membantu."
+            )
+        return None
     except Exception as exc:  # noqa: BLE001
         logger.exception("csat forward failed: %s", exc)
         return None
@@ -554,20 +582,36 @@ async def webhook(request: Request):
             text=text,
             name=body.get("name", ""),
         )
-        if csat_reply:
+        if csat_reply == "__cs_handled__":
+            # CS Agent sudah handle sendiri (kirim WA langsung).
+            # Bot TIDAK kirim fallback lagi (anti double-send).
+            logger.warning(
+                "ROUTE DEBUG: csat handled by agent. skip bot reply. phone=%s device=%s",
+                phone, device,
+            )
+            # Tetap persist log customer chat ke wa_messages (untuk audit)
+            _persist_wa_log(
+                phone, text, "[handled-by-cs-agent]", user_id=csat_tenant,
+            )
+            return {"status": "ok", "mode": "cs_handled_by_agent", "wa_logged": True}
+        elif csat_reply:
             reply = f"{bot_header()}\n\n{csat_reply}"
+            await asyncio.sleep(random_typing_delay())
+            await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
+            logged = _persist_wa_log(phone, text, reply, user_id=csat_tenant)
+            return {"status": "ok", "mode": "cs_customer", "wa_logged": logged}
         else:
+            # CS Agent gagal total — fallback
             reply = (
                 f"{bot_header()}\n\n"
                 f"Halo! 👋 Selamat datang di toko kami.\n"
                 f"Silakan tanya produk, harga, atau stok ya~\n"
                 f"Admin kami akan segera membantu 😊"
             )
-        await asyncio.sleep(random_typing_delay())
-        await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
-        # Persist customer chat ke wa_messages pakai tenant UUID (bukan customer phone)
-        logged = _persist_wa_log(phone, text, reply, user_id=csat_tenant)
-        return {"status": "ok", "mode": "cs_customer", "wa_logged": logged}
+            await asyncio.sleep(random_typing_delay())
+            await send_wa_reply(phone, reply, inboxid=inboxid, device=device)
+            logged = _persist_wa_log(phone, text, reply, user_id=csat_tenant)
+            return {"status": "ok", "mode": "cs_fallback", "wa_logged": logged}
 
     # === OWNER ROUTE — halo/ping check ===
     # Hanya sampai sini kalau pengirim adalah owner (atau nomor tidak dikenal +
